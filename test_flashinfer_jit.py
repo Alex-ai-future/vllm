@@ -109,10 +109,10 @@ def test_jit_compile():
         import signal
         
         def timeout_handler(signum, frame):
-            raise TimeoutError("JIT compilation timed out after 60 seconds")
+            raise TimeoutError("JIT compilation timed out after 600 seconds")
         
         signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(60)  # 60 second timeout
+        signal.alarm(600)  # 10 minute timeout for first-time compilation
         
         try:
             module = get_gdn_prefill_module()
@@ -130,8 +130,8 @@ def test_jit_compile():
             logger.info("Building and loading module...")
             start_build = time.time()
             
-            # Set longer timeout for build
-            signal.alarm(120)  # 2 minute timeout for build
+            # Set longer timeout for build (10 minutes for first-time compilation)
+            signal.alarm(600)  # 10 minute timeout
             
             # Add verbose logging
             logger.info("Calling build_and_load() with verbose=True...")
