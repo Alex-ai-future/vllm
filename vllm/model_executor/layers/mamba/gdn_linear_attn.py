@@ -129,8 +129,10 @@ def fi_chunk_gated_delta_rule(
     # Use a timer to detect hangs
     import threading
     import sys
+    import traceback
     
     hang_detected = False
+    main_thread = threading.main_thread()
     
     def watchdog_timer():
         nonlocal hang_detected
@@ -138,11 +140,17 @@ def fi_chunk_gated_delta_rule(
         if not hasattr(thread_local, 'kernel_done'):
             hang_detected = True
             logger.error("[fi_chunk_gated_delta_rule] *** HANG DETECTED: Kernel running for >30 seconds ***")
-            # Print thread stack traces for debugging
+            # Print ALL thread stack traces for debugging
+            logger.error("[fi_chunk_gated_delta_rule] === All Thread Stacks ===")
             for thread_id, frame in sys._current_frames().items():
-                logger.error("[fi_chunk_gated_delta_rule] Thread %d stack:", thread_id)
-                import traceback
+                thread_name = "Unknown"
+                for t in threading.enumerate():
+                    if t.ident == thread_id:
+                        thread_name = t.name
+                        break
+                logger.error("[fi_chunk_gated_delta_rule] Thread %d (%s) stack:", thread_id, thread_name)
                 logger.error("".join(traceback.format_stack(frame)))
+            logger.error("[fi_chunk_gated_delta_rule] === End Thread Stacks ===")
     
     timer_thread = threading.Thread(target=watchdog_timer, daemon=True)
     thread_local = threading.local()
