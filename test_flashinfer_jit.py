@@ -2,7 +2,12 @@
 """
 Diagnostic script for FlashInfer GDN prefill JIT compile hang issue.
 
-This script helps identify why FlashInfer JIT compilation hangs.
+Run this script on the Linux server where vLLM is running:
+    python test_flashinfer_jit.py
+
+Or copy to remote server and run:
+    scp test_flashinfer_jit.py user@server:/tmp/
+    ssh user@server "python /tmp/test_flashinfer_jit.py"
 """
 
 import os
