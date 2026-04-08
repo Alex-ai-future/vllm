@@ -75,11 +75,13 @@ def fi_chunk_gated_delta_rule(
     logger.info("[fi_chunk_gated_delta_rule] Starting FlashInfer GDN prefill kernel")
     import time
     import torch
+    import os
     start_time = time.time()
     
-    # Log GPU state before kernel call
-    device = q.device
-    logger.info("[fi_chunk_gated_delta_rule] Device: %s", device)
+    # Log environment info
+    logger.info("[fi_chunk_gated_delta_rule] Device: %s", q.device)
+    logger.info("[fi_chunk_gated_delta_rule] CUDA_VISIBLE_DEVICES: %s", os.environ.get('CUDA_VISIBLE_DEVICES', 'not set'))
+    logger.info("[fi_chunk_gated_delta_rule] FLASHINFER_CACHE_DIR: %s", os.environ.get('FLASHINFER_CACHE_DIR', 'not set'))
     logger.info("[fi_chunk_gated_delta_rule] Input shapes - q: %s, k: %s, v: %s, g: %s, beta: %s, state: %s",
                 q.shape, k.shape, v.shape, g.shape, beta.shape, initial_state.shape)
     logger.info("[fi_chunk_gated_delta_rule] Input dtypes - q: %s, k: %s, v: %s, g: %s, beta: %s, state: %s",
@@ -87,13 +89,19 @@ def fi_chunk_gated_delta_rule(
     logger.info("[fi_chunk_gated_delta_rule] output_final_state: %s, cu_seqlens: %s", 
                 output_final_state, cu_seqlens.shape if cu_seqlens is not None else None)
 
+    logger.info("[fi_chunk_gated_delta_rule] About to import flashinfer.gdn_prefill (this may trigger JIT compile)")
+    jit_start = time.time()
+    
     try:
         from flashinfer.gdn_prefill import (
             chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
         )
-        logger.info("[fi_chunk_gated_delta_rule] Imported flashinfer.gdn_prefill successfully")
+        logger.info("[fi_chunk_gated_delta_rule] Imported flashinfer.gdn_prefill successfully in %.2f seconds", time.time() - jit_start)
     except ImportError as e:
         logger.error("[fi_chunk_gated_delta_rule] Failed to import flashinfer.gdn_prefill: %s", e)
+        raise
+    except Exception as e:
+        logger.error("[fi_chunk_gated_delta_rule] Unexpected error during import: %s", e)
         raise
 
     if use_qk_l2norm_in_kernel:
