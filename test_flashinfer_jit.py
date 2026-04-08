@@ -87,8 +87,16 @@ def check_flashinfer():
     return True
 
 def test_jit_compile():
-    """Test FlashInfer JIT compilation with timeout."""
+    """Test FlashInfer JIT compilation with limited concurrency."""
     logger.info("=== JIT Compile Test ===")
+    
+    # Set environment variables to limit compilation concurrency
+    # This prevents OOM when compiling many kernel variants
+    os.environ['MAX_JOBS'] = os.environ.get('MAX_JOBS', '2')
+    os.environ['NVCC_THREADS'] = os.environ.get('NVCC_THREADS', '1')
+    
+    logger.info(f"MAX_JOBS: {os.environ['MAX_JOBS']}")
+    logger.info(f"NVCC_THREADS: {os.environ['NVCC_THREADS']}")
     
     try:
         logger.info("Importing flashinfer.gdn_prefill (this may trigger JIT)...")
@@ -151,7 +159,7 @@ def test_jit_compile():
                 )
                 # Filter for relevant processes
                 for line in result.stdout.split('\n'):
-                    if any(x in line for x in ['ninja', 'nvcc', 'g++', 'ptxas', 'cudafe']):
+                    if any(x in line for x in ['ninja', 'nvcc', 'g++', 'ptxas', 'cudafe', 'cicc']):
                         logger.info(f"Running: {line}")
             except Exception as e:
                 logger.warning(f"Could not check processes: {e}")
