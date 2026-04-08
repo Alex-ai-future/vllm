@@ -228,9 +228,11 @@ class EngineCore:
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
         start = time.time()
+        logger.info("[_initialize_kv_caches] Starting KV cache initialization")
 
         # Get all kv cache needed by the model
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
+        logger.info("[_initialize_kv_caches] Got %d KV cache specs", len(kv_cache_specs))
 
         has_kv_cache = any(kv_cache_spec for kv_cache_spec in kv_cache_specs)
         if has_kv_cache:
@@ -244,8 +246,12 @@ class EngineCore:
             else:
                 # Profiles the peak memory usage of the model to determine how
                 # much memory can be allocated for kv cache.
+                logger.info("[_initialize_kv_caches] Starting memory profiling (determine_available_memory)...")
+                profile_start = time.time()
                 available_gpu_memory = self.model_executor.determine_available_memory()
+                logger.info("[_initialize_kv_caches] Memory profiling completed in %.2f seconds", time.time() - profile_start)
                 self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
+                logger.info("[_initialize_kv_caches] Available GPU memory for KV cache: %.2f GiB", available_gpu_memory[0] / 1024**3)
         else:
             # Attention free models don't need memory for kv cache
             available_gpu_memory = [0] * len(kv_cache_specs)
@@ -277,7 +283,10 @@ class EngineCore:
         vllm_config.validate_block_size()
 
         # Initialize kv cache and warmup the execution
+        logger.info("[_initialize_kv_caches] Starting KV cache initialization and model warmup...")
+        init_start = time.time()
         self.model_executor.initialize_from_config(kv_cache_configs)
+        logger.info("[_initialize_kv_caches] KV cache initialization and model warmup completed in %.2f seconds", time.time() - init_start)
 
         elapsed = time.time() - start
         logger.info_once(
@@ -794,6 +803,9 @@ class EngineCoreProc(EngineCore):
         *,
         engine_index: int = 0,
     ):
+        logger.info("[EngineCoreProc.__init__] Starting EngineCoreProc initialization")
+        init_start = time.time()
+        
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
         self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
         executor_fail_callback = lambda: self.input_queue.put_nowait(
@@ -811,6 +823,8 @@ class EngineCoreProc(EngineCore):
             self.tensor_ipc_receiver = TensorIpcReceiver(tensor_queue)
             logger.info("Using tensor IPC queue for multimodal tensor sharing")
 
+        logger.info("[EngineCoreProc.__init__] Starting handshakes")
+        handshake_start = time.time()
         with self._perform_handshakes(
             handshake_address,
             identity,
@@ -818,6 +832,8 @@ class EngineCoreProc(EngineCore):
             vllm_config,
             client_handshake_address,
         ) as addresses:
+            logger.info("[EngineCoreProc.__init__] Handshakes completed in %.2f seconds", time.time() - handshake_start)
+            
             # Set up data parallel environment.
             self.has_coordinator = addresses.coordinator_output is not None
             self.frontend_stats_publish_address = (
@@ -845,6 +861,8 @@ class EngineCoreProc(EngineCore):
                 )
             self._init_data_parallel(vllm_config)
 
+            logger.info("[EngineCoreProc.__init__] Calling super().__init__() (this initializes model and KV cache)")
+            super_init_start = time.time()
             super().__init__(
                 vllm_config,
                 executor_class,
@@ -852,12 +870,14 @@ class EngineCoreProc(EngineCore):
                 executor_fail_callback,
                 internal_dp_balancing,
             )
+            logger.info("[EngineCoreProc.__init__] super().__init__() completed in %.2f seconds", time.time() - super_init_start)
 
             # Background Threads and Queues for IO. These enable us to
             # overlap ZMQ socket IO with GPU since they release the GIL,
             # and to overlap some serialization/deserialization with the
             # model forward pass.
             # Threads handle Socket <-> Queues and core_busy_loop uses Queue.
+            logger.info("[EngineCoreProc.__init__] Starting input/output threads")
             ready_event = threading.Event()
             input_thread = threading.Thread(
                 target=self.process_input_sockets,
@@ -960,6 +980,7 @@ class EngineCoreProc(EngineCore):
         vllm_config: VllmConfig,
         parallel_config_to_update: ParallelConfig | None = None,
     ) -> Generator[EngineZmqAddresses, None, None]:
+        logger.info("[_perform_handshake] Starting handshake with front-end")
         with make_zmq_socket(
             ctx,
             handshake_address,
@@ -969,12 +990,15 @@ class EngineCoreProc(EngineCore):
             bind=False,
         ) as handshake_socket:
             # Register engine with front-end.
+            logger.info("[_perform_handshake] Calling startup_handshake")
             addresses = self.startup_handshake(
                 handshake_socket, local_client, headless, parallel_config_to_update
             )
+            logger.info("[_perform_handshake] Handshake completed, yielding addresses")
             yield addresses
 
             # Send ready message.
+            logger.info("[_perform_handshake] Preparing READY message (num_gpu_blocks=%s)", vllm_config.cache_config.num_gpu_blocks)
             num_gpu_blocks = vllm_config.cache_config.num_gpu_blocks
             # We pass back the coordinator stats update address here for the
             # external LB case for our colocated front-end to use (coordinator
@@ -994,7 +1018,10 @@ class EngineCoreProc(EngineCore):
                     vllm_config.parallel_config.compute_hash()
                 )
 
+            logger.info("[_perform_handshake] Sending READY message")
+            send_start = time.time()
             handshake_socket.send(msgspec.msgpack.encode(ready_msg))
+            logger.info("[_perform_handshake] READY message sent in %.2f seconds", time.time() - send_start)
 
     @staticmethod
     def startup_handshake(

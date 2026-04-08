@@ -72,15 +72,26 @@ def fi_chunk_gated_delta_rule(
     cu_seqlens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
 ):
-    from flashinfer.gdn_prefill import (
-        chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
-    )
+    logger.info("[fi_chunk_gated_delta_rule] Starting FlashInfer GDN prefill kernel")
+    import time
+    start_time = time.time()
+    
+    try:
+        from flashinfer.gdn_prefill import (
+            chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
+        )
+        logger.info("[fi_chunk_gated_delta_rule] Imported flashinfer.gdn_prefill successfully")
+    except ImportError as e:
+        logger.error("[fi_chunk_gated_delta_rule] Failed to import flashinfer.gdn_prefill: %s", e)
+        raise
 
     if use_qk_l2norm_in_kernel:
+        logger.info("[fi_chunk_gated_delta_rule] Running l2norm_fwd")
         q = l2norm_fwd(q)
         k = l2norm_fwd(k)
 
     # use flashinfer implementation
+    logger.info("[fi_chunk_gated_delta_rule] Preparing tensors (squeeze/contiguous)")
     q = q.squeeze(0).contiguous()
     k = k.squeeze(0).contiguous()
     v = v.squeeze(0).contiguous()
@@ -90,6 +101,9 @@ def fi_chunk_gated_delta_rule(
     fi_state = initial_state.to(torch.float32)
     fi_g = g.to(torch.float32)
     fi_beta = beta.to(torch.float32)
+    
+    logger.info("[fi_chunk_gated_delta_rule] Calling chunk_gated_delta_rule_fi (JIT compiled kernel)")
+    kernel_start = time.time()
     result = chunk_gated_delta_rule_fi(
         q=q,
         k=k,
@@ -100,14 +114,22 @@ def fi_chunk_gated_delta_rule(
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
     )
+    logger.info("[fi_chunk_gated_delta_rule] Kernel execution completed in %.2f seconds", time.time() - kernel_start)
+    
     # FlashInfer returns (output, state) when output_final_state=True,
     # or just output when output_final_state=False.
     # Unsqueeze back to 4D (1, L, H, D) to match fla output format
     if output_final_state:
         output, final_state = result
-        return output.unsqueeze(0), final_state
+        logger.info("[fi_chunk_gated_delta_rule] Returning output with final_state")
+        result_ret = output.unsqueeze(0), final_state
     else:
-        return result.unsqueeze(0), None
+        logger.info("[fi_chunk_gated_delta_rule] Returning output only")
+        result_ret = result.unsqueeze(0), None
+    
+    total_time = time.time() - start_time
+    logger.info("[fi_chunk_gated_delta_rule] Total execution time: %.2f seconds", total_time)
+    return result_ret
 
 
 @CustomOp.register("chunk_gated_delta_rule")
@@ -590,9 +612,15 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         which has fixed kernel parameters (no autotuning), so only the
         prefill (chunked) path needs warming up.
         """
+        logger.info("[_warmup_prefill_kernels] Starting GDN prefill kernel warmup for layer %s", self.prefix)
+        import time
+        warmup_start = time.time()
+        
         if hasattr(self, "_prefill_kernels_warmed_up"):
+            logger.info("[_warmup_prefill_kernels] Kernels already warmed up for layer %s", self.prefix)
             return
         self._prefill_kernels_warmed_up = True
+        logger.info("[_warmup_prefill_kernels] Creating dummy tensors for warmup (T=%d)", FLA_CHUNK_SIZE)
 
         device = mixed_qkv.device
         dtype = mixed_qkv.dtype
@@ -610,9 +638,11 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         # inference, so we construct them with the same function
         # (fused_gdn_gating). dummy_a and dummy_b are throwaway
         # inputs required by that function.
+        logger.info("[_warmup_prefill_kernels] Running fused_gdn_gating")
         dummy_a = torch.randn(T, num_v_heads, device=device, dtype=dtype)
         dummy_b = torch.randn(T, num_v_heads, device=device, dtype=dtype)
         g, beta = fused_gdn_gating(self.A_log, dummy_a, dummy_b, self.dt_bias)
+        logger.info("[_warmup_prefill_kernels] Creating state tensor")
         state = torch.zeros(
             1,
             num_v_heads,
@@ -622,6 +652,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             dtype=state_dtype,
         )
         cu_seqlens = torch.tensor([0, T], device=device, dtype=torch.int32)
+        logger.info("[_warmup_prefill_kernels] Calling chunk_gated_delta_rule...")
 
         try:
             self.chunk_gated_delta_rule(
@@ -645,10 +676,11 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 exc_info=True,
             )
         else:
-            logger.debug(
-                "GDN prefill kernel warmup (T=%d) completed for layer %s",
+            logger.info(
+                "[_warmup_prefill_kernels] GDN prefill kernel warmup (T=%d) completed for layer %s in %.2f seconds",
                 T,
                 self.prefix,
+                time.time() - warmup_start,
             )
         finally:
             del q, k, v, dummy_a, dummy_b, g, beta, state, cu_seqlens
