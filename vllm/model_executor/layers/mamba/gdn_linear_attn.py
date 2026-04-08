@@ -74,8 +74,19 @@ def fi_chunk_gated_delta_rule(
 ):
     logger.info("[fi_chunk_gated_delta_rule] Starting FlashInfer GDN prefill kernel")
     import time
+    import torch
     start_time = time.time()
     
+    # Log GPU state before kernel call
+    device = q.device
+    logger.info("[fi_chunk_gated_delta_rule] Device: %s", device)
+    logger.info("[fi_chunk_gated_delta_rule] Input shapes - q: %s, k: %s, v: %s, g: %s, beta: %s, state: %s",
+                q.shape, k.shape, v.shape, g.shape, beta.shape, initial_state.shape)
+    logger.info("[fi_chunk_gated_delta_rule] Input dtypes - q: %s, k: %s, v: %s, g: %s, beta: %s, state: %s",
+                q.dtype, k.dtype, v.dtype, g.dtype, beta.dtype, initial_state.dtype)
+    logger.info("[fi_chunk_gated_delta_rule] output_final_state: %s, cu_seqlens: %s", 
+                output_final_state, cu_seqlens.shape if cu_seqlens is not None else None)
+
     try:
         from flashinfer.gdn_prefill import (
             chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
@@ -87,11 +98,14 @@ def fi_chunk_gated_delta_rule(
 
     if use_qk_l2norm_in_kernel:
         logger.info("[fi_chunk_gated_delta_rule] Running l2norm_fwd")
+        l2norm_start = time.time()
         q = l2norm_fwd(q)
         k = l2norm_fwd(k)
+        logger.info("[fi_chunk_gated_delta_rule] l2norm_fwd completed in %.4f seconds", time.time() - l2norm_start)
 
     # use flashinfer implementation
     logger.info("[fi_chunk_gated_delta_rule] Preparing tensors (squeeze/contiguous)")
+    prepare_start = time.time()
     q = q.squeeze(0).contiguous()
     k = k.squeeze(0).contiguous()
     v = v.squeeze(0).contiguous()
@@ -101,21 +115,65 @@ def fi_chunk_gated_delta_rule(
     fi_state = initial_state.to(torch.float32)
     fi_g = g.to(torch.float32)
     fi_beta = beta.to(torch.float32)
+    logger.info("[fi_chunk_gated_delta_rule] Tensor preparation completed in %.4f seconds", time.time() - prepare_start)
+    logger.info("[fi_chunk_gated_delta_rule] Prepared shapes - q: %s, k: %s, v: %s", q.shape, k.shape, v.shape)
     
     logger.info("[fi_chunk_gated_delta_rule] Calling chunk_gated_delta_rule_fi (JIT compiled kernel)")
-    kernel_start = time.time()
-    result = chunk_gated_delta_rule_fi(
-        q=q,
-        k=k,
-        v=v,
-        g=torch.exp(fi_g),
-        beta=fi_beta,
-        initial_state=fi_state,
-        output_final_state=output_final_state,
-        cu_seqlens=cu_seqlens,
-    )
-    logger.info("[fi_chunk_gated_delta_rule] Kernel execution completed in %.2f seconds", time.time() - kernel_start)
+    logger.info("[fi_chunk_gated_delta_rule] *** WARNING: If this hangs, the FlashInfer kernel is the problem ***")
     
+    # Synchronize before kernel launch
+    torch.cuda.synchronize(device)
+    kernel_start = time.time()
+    logger.info("[fi_chunk_gated_delta_rule] Kernel launch time: %s", time.strftime('%H:%M:%S', time.localtime(kernel_start)))
+    
+    # Use a timer to detect hangs
+    import threading
+    import sys
+    
+    hang_detected = False
+    
+    def watchdog_timer():
+        nonlocal hang_detected
+        time.sleep(30)  # 30 second timeout
+        if not hasattr(thread_local, 'kernel_done'):
+            hang_detected = True
+            logger.error("[fi_chunk_gated_delta_rule] *** HANG DETECTED: Kernel running for >30 seconds ***")
+            # Print thread stack traces for debugging
+            for thread_id, frame in sys._current_frames().items():
+                logger.error("[fi_chunk_gated_delta_rule] Thread %d stack:", thread_id)
+                import traceback
+                logger.error("".join(traceback.format_stack(frame)))
+    
+    timer_thread = threading.Thread(target=watchdog_timer, daemon=True)
+    thread_local = threading.local()
+    timer_thread.start()
+    
+    try:
+        result = chunk_gated_delta_rule_fi(
+            q=q,
+            k=k,
+            v=v,
+            g=torch.exp(fi_g),
+            beta=fi_beta,
+            initial_state=fi_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+        )
+        thread_local.kernel_done = True  # Signal that kernel completed
+    except Exception as e:
+        thread_local.kernel_done = True
+        logger.error("[fi_chunk_gated_delta_rule] Kernel raised exception: %s", e)
+        raise
+    
+    # Synchronize after kernel launch to get accurate timing
+    logger.info("[fi_chunk_gated_delta_rule] Kernel returned, synchronizing...")
+    torch.cuda.synchronize(device)
+    elapsed = time.time() - kernel_start
+    logger.info("[fi_chunk_gated_delta_rule] Kernel execution completed in %.2f seconds", elapsed)
+    if hang_detected:
+        logger.error("[fi_chunk_gated_delta_rule] Hang was detected but kernel eventually completed")
+    logger.info("[fi_chunk_gated_delta_rule] Synchronization completed at %s", time.strftime('%H:%M:%S', time.localtime(time.time())))
+
     # FlashInfer returns (output, state) when output_final_state=True,
     # or just output when output_final_state=False.
     # Unsqueeze back to 4D (1, L, H, D) to match fla output format
@@ -126,7 +184,7 @@ def fi_chunk_gated_delta_rule(
     else:
         logger.info("[fi_chunk_gated_delta_rule] Returning output only")
         result_ret = result.unsqueeze(0), None
-    
+
     total_time = time.time() - start_time
     logger.info("[fi_chunk_gated_delta_rule] Total execution time: %.2f seconds", total_time)
     return result_ret
