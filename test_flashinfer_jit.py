@@ -114,13 +114,22 @@ def test_jit_compile():
             
             logger.info(f"Module obtained in {time.time() - start:.2f} seconds")
             logger.info(f"Module: {module}")
+            logger.info(f"Module build_dir: {getattr(module, 'build_dir', 'unknown')}")
+            
+            # Check if module is already compiled
+            if hasattr(module, 'built'):
+                logger.info(f"Module already built: {module.built}")
             
             # Try to build and load
             logger.info("Building and loading module...")
             start_build = time.time()
+            
+            # Set longer timeout for build
             signal.alarm(120)  # 2 minute timeout for build
             
-            loaded = module.build_and_load()
+            # Add verbose logging
+            logger.info("Calling build_and_load() with verbose=True...")
+            loaded = module.build_and_load(verbose=True)
             signal.alarm(0)  # Cancel alarm
             
             logger.info(f"Module built and loaded in {time.time() - start_build:.2f} seconds")
@@ -131,6 +140,22 @@ def test_jit_compile():
         except TimeoutError as e:
             logger.error(str(e))
             logger.error("JIT compilation is hanging - this is the problem!")
+            
+            # Try to find what's running
+            logger.info("=== Checking running processes ===")
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ['ps', 'aux'],
+                    capture_output=True, text=True, timeout=10
+                )
+                # Filter for relevant processes
+                for line in result.stdout.split('\n'):
+                    if any(x in line for x in ['ninja', 'nvcc', 'g++', 'ptxas', 'cudafe']):
+                        logger.info(f"Running: {line}")
+            except Exception as e:
+                logger.warning(f"Could not check processes: {e}")
+            
             return False
         except Exception as e:
             logger.error(f"JIT compile failed: {e}")
