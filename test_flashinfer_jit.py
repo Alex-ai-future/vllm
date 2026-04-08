@@ -10,7 +10,11 @@ Or copy to remote server and run:
     ssh user@server "python /tmp/test_flashinfer_jit.py"
 """
 
+# IMPORTANT: Set these BEFORE importing flashinfer to limit compilation concurrency
 import os
+os.environ['MAX_JOBS'] = os.environ.get('MAX_JOBS', '2')
+os.environ['NVCC_THREADS'] = os.environ.get('NVCC_THREADS', '1')
+
 import sys
 import time
 import subprocess
@@ -89,12 +93,6 @@ def check_flashinfer():
 def test_jit_compile():
     """Test FlashInfer JIT compilation with limited concurrency."""
     logger.info("=== JIT Compile Test ===")
-    
-    # Set environment variables to limit compilation concurrency
-    # This prevents OOM when compiling many kernel variants
-    os.environ['MAX_JOBS'] = os.environ.get('MAX_JOBS', '2')
-    os.environ['NVCC_THREADS'] = os.environ.get('NVCC_THREADS', '1')
-    
     logger.info(f"MAX_JOBS: {os.environ['MAX_JOBS']}")
     logger.info(f"NVCC_THREADS: {os.environ['NVCC_THREADS']}")
     
