@@ -74,9 +74,28 @@ def fi_chunk_gated_delta_rule(
     cu_seqlens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
 ):
-    from flashinfer.gdn_prefill import (
-        chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
-    )
+    try:
+        from flashinfer.gdn_prefill import (
+            chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
+        )
+    except Exception as e:
+        error_msg = (
+            f"FlashInfer GDN prefill kernel import failed: {e}\n\n"
+            "This is likely due to JIT compilation failure. "
+            "Suggested fixes:\n"
+            "  1. Use Triton backend (recommended): --gdn-prefill-backend triton\n"
+            "  2. Check CUDA library paths:\n"
+            "     export LD_LIBRARY_PATH=/opt/conda/lib:$LD_LIBRARY_PATH\n"
+            "  3. Limit parallel compilation:\n"
+            "     export MAX_JOBS=2\n"
+            "     export NVCC_THREADS=1\n"
+            "  4. Run diagnostic: python test_flashinfer_jit.py\n"
+        )
+        logger.error(error_msg)
+        raise RuntimeError(
+            "FlashInfer GDN prefill kernel failed to load. "
+            "Quick fix: use --gdn-prefill-backend triton"
+        ) from e
 
     if use_qk_l2norm_in_kernel:
         q = l2norm_fwd(q)
@@ -92,16 +111,31 @@ def fi_chunk_gated_delta_rule(
     fi_state = initial_state.to(torch.float32)
     fi_g = g.to(torch.float32)
     fi_beta = beta.to(torch.float32)
-    result = chunk_gated_delta_rule_fi(
-        q=q,
-        k=k,
-        v=v,
-        g=torch.exp(fi_g),
-        beta=fi_beta,
-        initial_state=fi_state,
-        output_final_state=output_final_state,
-        cu_seqlens=cu_seqlens,
-    )
+    try:
+        result = chunk_gated_delta_rule_fi(
+            q=q,
+            k=k,
+            v=v,
+            g=torch.exp(fi_g),
+            beta=fi_beta,
+            initial_state=fi_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+        )
+    except Exception as e:
+        error_msg = (
+            f"FlashInfer GDN prefill kernel execution failed: {e}\n\n"
+            "Suggested fixes:\n"
+            "  1. Use Triton backend: --gdn-prefill-backend triton\n"
+            "  2. Check GPU compatibility (requires Hopper H100+)\n"
+            "  3. Ensure sufficient GPU memory\n"
+        )
+        logger.error(error_msg)
+        raise RuntimeError(
+            "FlashInfer GDN prefill kernel execution failed. "
+            "Quick fix: use --gdn-prefill-backend triton"
+        ) from e
+
     # FlashInfer returns (output, state) when output_final_state=True,
     # or just output when output_final_state=False.
     # Unsqueeze back to 4D (1, L, H, D) to match fla output format
@@ -125,18 +159,40 @@ class ChunkGatedDeltaRule(CustomOp):
             current_platform.is_cuda() and current_platform.is_device_capability(90)
         )
 
+        # Pre-check if FlashInfer GDN prefill module is available.
+        # This avoids runtime failures during first inference when JIT
+        # compilation or library loading fails.
+        flashinfer_available = False
+        if supports_flashinfer:
+            try:
+                import flashinfer.gdn_prefill  # noqa: F401
+
+                flashinfer_available = True
+            except ImportError:
+                flashinfer_available = False
+
         if backend == "flashinfer":
-            use_flashinfer = supports_flashinfer
+            use_flashinfer = supports_flashinfer and flashinfer_available
             if not use_flashinfer:
-                logger.warning_once(
-                    "GDN prefill backend 'flashinfer' is selected but "
-                    "cannot use this kernel on the current platform. "
-                    "Falling back to Triton/FLA."
-                )
+                if not supports_flashinfer:
+                    logger.warning_once(
+                        "GDN prefill backend 'flashinfer' is selected but "
+                        "cannot use this kernel on the current platform. "
+                        "Falling back to Triton/FLA."
+                    )
+                else:
+                    logger.warning_once(
+                        "GDN prefill backend 'flashinfer' is selected but "
+                        "FlashInfer GDN prefill module is not available "
+                        "(JIT compilation or library loading failed). "
+                        "Falling back to Triton/FLA. "
+                        "To use FlashInfer, set `--gdn-prefill-backend triton`."
+                    )
         elif backend == "triton":
             use_flashinfer = False
         else:
-            use_flashinfer = supports_flashinfer
+            # auto mode: use FlashInfer only if both platform and module are available
+            use_flashinfer = supports_flashinfer and flashinfer_available
 
         if use_flashinfer:
             logger.info_once("Using FlashInfer GDN prefill kernel", scope="local")
