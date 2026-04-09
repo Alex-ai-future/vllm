@@ -196,12 +196,86 @@ class ChunkGatedDeltaRule(CustomOp):
 
         if use_flashinfer:
             logger.info_once("Using FlashInfer GDN prefill kernel", scope="local")
-            logger.info_once(
-                "FlashInfer GDN prefill kernel is JIT-compiled; first run may "
-                "take a while to compile. Set `--gdn-prefill-backend triton` to "
-                "avoid JIT compile time.",
-                scope="local",
-            )
+
+            # Check if using precompiled cubins or JIT compilation
+            from vllm.utils.flashinfer import has_flashinfer_cubin
+
+            if has_flashinfer_cubin():
+                logger.info_once(
+                    "FlashInfer GDN prefill kernel using precompiled cubins "
+                    "(no compilation needed).",
+                    scope="local",
+                )
+            else:
+                # Estimate memory requirements for JIT compilation
+                import os
+
+                # Get system memory info
+                try:
+                    import psutil
+
+                    total_ram_gb = psutil.virtual_memory().total / (1024**3)
+                    available_ram_gb = psutil.virtual_memory().available / (1024**3)
+                except ImportError:
+                    total_ram_gb = None
+                    available_ram_gb = None
+
+                # Get CPU cores
+                try:
+                    cpu_cores = len(os.sched_getaffinity(0))  # type: ignore
+                except AttributeError:
+                    cpu_cores = os.cpu_count() or 1
+
+                # Calculate compilation memory (MAX_JOBS × ~3GB per job)
+                max_jobs = int(os.environ.get("MAX_JOBS", cpu_cores))
+                comp_memory_gb = max_jobs * 3
+
+                # Build memory info message
+                ram_info = []
+                ram_info.append("  Estimated memory requirements:")
+                ram_info.append(
+                    f"    - Compilation: ~{comp_memory_gb}GB "
+                    f"({max_jobs} concurrent jobs × ~3GB each)"
+                )
+                ram_info.append(
+                    "    - Model loading: ~70-140GB (depends on model size)"
+                )
+                ram_info.append("    - KV Cache: ~10-50GB (depends on configuration)")
+                ram_info.append(f"    - Total estimated: ~{comp_memory_gb + 100}GB")
+                ram_info.append("")
+                ram_info.append("  Current system:")
+                if total_ram_gb:
+                    ram_info.append(f"    - Total RAM: {total_ram_gb:.0f}GB")
+                else:
+                    ram_info.append("    - Total RAM: Unknown")
+                if available_ram_gb:
+                    ram_info.append(f"    - Available RAM: {available_ram_gb:.0f}GB")
+                else:
+                    ram_info.append("    - Available RAM: Unknown")
+                ram_info.append(
+                    f"    - CPU cores: {cpu_cores} (using {max_jobs} for compilation)"
+                )
+                ram_info.append("")
+                ram_info.append(
+                    "  ⚠️  If available memory is insufficient, "
+                    "compilation may fail or OOM."
+                )
+                ram_info.append("")
+                ram_info.append("  To reduce compilation memory usage:")
+                ram_info.append("    - Set MAX_JOBS=1 (uses ~3GB): export MAX_JOBS=1")
+                ram_info.append(
+                    "    - Install precompiled kernels: pip install flashinfer-cubin"
+                )
+                ram_info.append(
+                    "    - Or use Triton backend: --gdn-prefill-backend triton"
+                )
+                ram_info.append("")
+                ram_info.append(
+                    "  To increase compilation speed (if you have enough memory):"
+                )
+                ram_info.append("    - Set MAX_JOBS=8: export MAX_JOBS=8")
+
+                logger.warning_once("\n".join(ram_info), scope="local")
         else:
             logger.info_once("Using Triton/FLA GDN prefill kernel", scope="local")
 
