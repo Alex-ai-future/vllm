@@ -168,7 +168,7 @@ class ChunkGatedDeltaRule(CustomOp):
                 import flashinfer.gdn_prefill  # noqa: F401
 
                 flashinfer_available = True
-            except ImportError:
+            except Exception:
                 flashinfer_available = False
 
         if backend == "flashinfer":
