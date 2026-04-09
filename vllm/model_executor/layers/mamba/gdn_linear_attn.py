@@ -186,7 +186,7 @@ class ChunkGatedDeltaRule(CustomOp):
                         "FlashInfer GDN prefill module is not available "
                         "(JIT compilation or library loading failed). "
                         "Falling back to Triton/FLA. "
-                        "To use FlashInfer, set `--gdn-prefill-backend triton`."
+                        "To use the Triton backend explicitly, set `--gdn-prefill-backend triton`."
                     )
         elif backend == "triton":
             use_flashinfer = False
