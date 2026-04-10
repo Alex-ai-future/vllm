@@ -31,3 +31,44 @@ def rms_norm(
     output = torch.empty(x.shape, device=x.device, dtype=x.dtype)
     torch.ops._C.rms_norm(output, x, weight, epsilon)
     return output
+
+
+#===================
+# GELU Activations
+#===================
+
+
+@ir.ops.gelu_new.register_impl("vllm_c", supported=CUDA_ALIKE)
+def gelu_new(x: Tensor) -> Tensor:
+    """
+    New GELU activation function using vLLM C++ kernel.
+
+    Formula: 0.5 * x * (1.0 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    """
+    out = torch.empty_like(x)
+    torch.ops._C.gelu_new(out, x)
+    return out
+
+
+@ir.ops.gelu_fast.register_impl("vllm_c", supported=CUDA_ALIKE)
+def gelu_fast(x: Tensor) -> Tensor:
+    """
+    Fast GELU activation function using vLLM C++ kernel.
+
+    Formula: 0.5 * x * (1.0 + tanh(x * 0.7978845608 * (1.0 + 0.044715 * x^2)))
+    """
+    out = torch.empty_like(x)
+    torch.ops._C.gelu_fast(out, x)
+    return out
+
+
+@ir.ops.quick_gelu.register_impl("vllm_c", supported=CUDA_ALIKE)
+def quick_gelu(x: Tensor) -> Tensor:
+    """
+    Quick GELU activation function using vLLM C++ kernel.
+
+    Formula: x * sigmoid(1.702 * x)
+    """
+    out = torch.empty_like(x)
+    torch.ops._C.gelu_quick(out, x)
+    return out
