@@ -8,9 +8,6 @@ import torch
 
 from tests.kernels.allclose_default import get_default_atol, get_default_rtol
 from tests.kernels.utils import opcheck
-from vllm.ir.ops import gelu_fast as gelu_fast_ir
-from vllm.ir.ops import gelu_new as gelu_new_ir
-from vllm.ir.ops import quick_gelu as quick_gelu_ir
 from vllm.model_executor.layers.activation import (
     FastGELU,
     FatreluAndMul,
@@ -122,9 +119,9 @@ def test_act_and_mul(
 @pytest.mark.parametrize(
     "activation",
     [
-        (FastGELU, gelu_fast_ir),
-        (NewGELU, gelu_new_ir),
-        (QuickGELU, quick_gelu_ir),
+        (FastGELU, torch.ops._C.gelu_fast),
+        (NewGELU, torch.ops._C.gelu_new),
+        (QuickGELU, torch.ops._C.gelu_quick),
     ],
 )
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
@@ -146,15 +143,12 @@ def test_activation(
     torch.set_default_device(device)
     x = torch.randn(num_tokens, d, dtype=dtype)
     layer = activation[0]()
-    ir_fn = activation[1]
+    fn = activation[1]
     out = layer(x)
     ref_out = layer.forward_native(x)
     torch.testing.assert_close(
         out, ref_out, atol=get_default_atol(out), rtol=get_default_rtol(out)
     )
 
-    # Test vLLM IR op directly
-    ir_out = ir_fn(x)
-    torch.testing.assert_close(
-        ir_out, ref_out, atol=get_default_atol(ir_out), rtol=get_default_rtol(ir_out)
-    )
+    out = torch.empty_like(x)
+    opcheck(fn, (out, x))
