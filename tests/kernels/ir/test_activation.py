@@ -10,6 +10,26 @@ from vllm import ir
 from vllm.platforms import current_platform
 
 
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(),
+    reason="vllm_c kernels only supported on CUDA-alike platforms",
+)
+def test_gelu_registration():
+    """Test that GELU ops have correct provider registration."""
+    expected = {
+        "native": True,
+        "vllm_c": True,
+    }
+
+    for op_name in ["gelu_new", "gelu_fast", "quick_gelu"]:
+        gelu_op = getattr(ir.ops, op_name)
+        actual = {
+            provider: impl.supported
+            for provider, impl in gelu_op.impls.items()
+        }
+        assert actual == expected, f"{op_name} has incorrect registration"
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("shape", [(1, 8), (4, 16), (17, 64)])
 class TestGeluOps:
