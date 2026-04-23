@@ -263,17 +263,13 @@ class GELU(CustomOp):
             self.op = None
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        return F.gelu(x, approximate="none")
+        return ir.ops.gelu(x)
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
-        if self.op and x.dtype == torch.bfloat16 and x.is_contiguous():
-            out = torch.empty_like(x)
-            self.op(out, x, "gelu")
-            return out
-        return self.forward_native(x)
+        return ir.ops.gelu(x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_native(x)
+        return ir.ops.gelu(x)
 
 
 # --8<-- [start:gelu_and_mul]
@@ -295,11 +291,7 @@ class GeluAndMul(CustomOp):
         self.approximate = approximate
         if approximate not in ("none", "tanh"):
             raise ValueError(f"Unknown approximate mode: {approximate}")
-        if (
-            current_platform.is_cuda_alike()
-            or current_platform.is_cpu()
-            or current_platform.is_xpu()
-        ):
+        if current_platform.is_cuda_alike() or current_platform.is_xpu():
             if approximate == "none":
                 self.op = torch.ops._C.gelu_and_mul
             elif approximate == "tanh":
@@ -313,19 +305,10 @@ class GeluAndMul(CustomOp):
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
-        # TODO: [ROCm] PyTorch's native GELU with tanh is unstable with torch.compile
-        approximate = self.approximate
-        if current_platform.is_rocm() and approximate == "tanh":
-            approximate = "none"
-        d = x.shape[-1] // 2
-        return F.gelu(x[..., :d], approximate=approximate) * x[..., d:]
+        return ir.ops.gelu_and_mul(x, approximate=self.approximate)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        output_shape = x.shape[:-1] + (d,)
-        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        self.op(out, x)
-        return out
+        return ir.ops.gelu_and_mul(x, approximate=self.approximate)
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_cuda(x)

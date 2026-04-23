@@ -31,6 +31,12 @@ class IrOpPriorityConfig:
     rms_norm: list[str] = Field(default_factory=list)
     """Priority list for vllm.ir.ops.rms_norm"""
 
+    gelu: list[str] = Field(default_factory=list)
+    """Priority list for vllm.ir.ops.gelu"""
+
+    gelu_and_mul: list[str] = Field(default_factory=list)
+    """Priority list for vllm.ir.ops.gelu_and_mul"""
+
     gelu_new: list[str] = Field(default_factory=list)
     """Priority list for vllm.ir.ops.gelu_new"""
 

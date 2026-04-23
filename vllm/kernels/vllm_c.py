@@ -33,6 +33,25 @@ def rms_norm(
     return output
 
 
+@ir.ops.gelu_and_mul.register_impl("vllm_c", supported=CUDA_ALIKE)
+def gelu_and_mul(x: Tensor, approximate: str = "none") -> Tensor:
+    """
+    GeGLU activation function: GELU(x[:d]) * x[d:] using vLLM C++ kernel.
+    
+    Shapes:
+        x: (num_tokens, 2 * d)
+        return: (num_tokens, d)
+    """
+    d = x.shape[-1] // 2
+    output_shape = x.shape[:-1] + (d,)
+    out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+    if approximate == "none":
+        torch.ops._C.gelu_and_mul(out, x)
+    else:
+        torch.ops._C.gelu_tanh_and_mul(out, x)
+    return out
+
+
 #===================
 # GELU Activations
 #===================
