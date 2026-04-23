@@ -22,6 +22,14 @@ def gelu_new(x: Tensor) -> Tensor:
     return 0.5 * x * (1.0 + torch.tanh(c_gelu_new * (x + 0.044715 * torch.pow(x, 3.0))))
 
 
+@gelu_new.register_input_generator
+def _gelu_new_input_generator(
+    num_tokens: int, hidden_size: int, dtype: torch.dtype
+) -> tuple:
+    x = torch.randn(num_tokens, hidden_size, dtype=dtype)
+    return (x,)
+
+
 @register_op
 def gelu_fast(x: Tensor) -> Tensor:
     """
@@ -36,6 +44,14 @@ def gelu_fast(x: Tensor) -> Tensor:
     )
 
 
+@gelu_fast.register_input_generator
+def _gelu_fast_input_generator(
+    num_tokens: int, hidden_size: int, dtype: torch.dtype
+) -> tuple:
+    x = torch.randn(num_tokens, hidden_size, dtype=dtype)
+    return (x,)
+
+
 @register_op
 def quick_gelu(x: Tensor) -> Tensor:
     """
@@ -47,3 +63,11 @@ def quick_gelu(x: Tensor) -> Tensor:
     Reference: https://github.com/huggingface/transformers/blob/main/src/transformers/activations.py#L90
     """
     return x * torch.sigmoid(1.702 * x)
+
+
+@quick_gelu.register_input_generator
+def _quick_gelu_input_generator(
+    num_tokens: int, hidden_size: int, dtype: torch.dtype
+) -> tuple:
+    x = torch.randn(num_tokens, hidden_size, dtype=dtype)
+    return (x,)
