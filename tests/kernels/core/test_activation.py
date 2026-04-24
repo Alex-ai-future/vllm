@@ -6,16 +6,15 @@ import random
 import pytest
 import torch
 
-from tests.kernels.allclose_default import get_default_atol, get_default_rtol
+from tests.kernels.allclose_default import get_default_atol
 from tests.kernels.utils import assert_pluggable_layer_calls_ir_op, opcheck
 from vllm import ir
-from vllm.platforms import current_platform
 from vllm.model_executor.layers.activation import (
-    FatreluAndMul,
     GELU,
+    FastGELU,
+    FatreluAndMul,
     GeluAndMul,
     MulAndSilu,
-    FastGELU,
     NewGELU,
     QuickGELU,
     SiluAndMul,
@@ -23,6 +22,7 @@ from vllm.model_executor.layers.activation import (
     SwigluStepAndMul,
     swiglustep_and_mul_triton,
 )
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
 DTYPES = [torch.half, torch.bfloat16, torch.float]
@@ -149,7 +149,7 @@ def test_activation_ir_op_routing(
     dtype: torch.dtype,
     seed: int,
 ) -> None:
-    """Test that activation PluggableLayer instances call the corresponding ir.ops function."""
+    """Test PluggableLayer instances call the corresponding ir.ops function."""
     set_random_seed(seed)
     x = torch.randn(num_tokens, d, dtype=dtype)
     layer = layer_cls(**kwargs)
