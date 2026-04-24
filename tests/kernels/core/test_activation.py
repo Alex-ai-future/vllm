@@ -9,6 +9,7 @@ import torch
 from tests.kernels.allclose_default import get_default_atol, get_default_rtol
 from tests.kernels.utils import assert_pluggable_layer_calls_ir_op, opcheck
 from vllm import ir
+from vllm.platforms import current_platform
 from vllm.model_executor.layers.activation import (
     FatreluAndMul,
     GELU,
@@ -37,6 +38,9 @@ CUDA_DEVICES = [
 # the ir.ops routing tests. As custom ops are migrated to PluggableLayer,
 # remove cases from here and add them to ACTIVATION_LAYER_CONFIGS.
 # Eventually, test_activation_ir_op_routing will be the single source of truth.
+@pytest.mark.skipif(
+    current_platform.is_cpu(), reason="CUDA activation tests require GPU platform"
+)
 @pytest.mark.parametrize(
     "activation",
     [
@@ -133,7 +137,6 @@ ACTIVATION_LAYER_CONFIGS = [
 @pytest.mark.parametrize("d", D)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
 def test_activation_ir_op_routing(
     default_vllm_config,
@@ -145,11 +148,9 @@ def test_activation_ir_op_routing(
     d: int,
     dtype: torch.dtype,
     seed: int,
-    device: str,
 ) -> None:
     """Test that activation PluggableLayer instances call the corresponding ir.ops function."""
     set_random_seed(seed)
-    torch.set_default_device(device)
     x = torch.randn(num_tokens, d, dtype=dtype)
     layer = layer_cls(**kwargs)
     assert_pluggable_layer_calls_ir_op(layer, ir_op, x)
