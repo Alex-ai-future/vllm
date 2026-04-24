@@ -132,11 +132,9 @@ ACTIVATION_LAYER_CONFIGS = [
 # This test verifies that PluggableLayer instances correctly dispatch to
 # their corresponding ir.ops functions. Add new activations to
 # ACTIVATION_LAYER_CONFIGS to automatically get test coverage.
+# The test only verifies routing correctness, not output values,
+# so we don't need multiple parameter combinations.
 @pytest.mark.parametrize("name, layer_cls, ir_op, kwargs", ACTIVATION_LAYER_CONFIGS)
-@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
-@pytest.mark.parametrize("d", D)
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("seed", SEEDS)
 @torch.inference_mode()
 def test_activation_ir_op_routing(
     default_vllm_config,
@@ -144,13 +142,8 @@ def test_activation_ir_op_routing(
     layer_cls: type,
     ir_op,
     kwargs: dict,
-    num_tokens: int,
-    d: int,
-    dtype: torch.dtype,
-    seed: int,
 ) -> None:
     """Test PluggableLayer instances call the corresponding ir.ops function."""
-    set_random_seed(seed)
-    x = torch.randn(num_tokens, d, dtype=dtype)
+    x = torch.randn(83, 512)
     layer = layer_cls(**kwargs)
     assert_pluggable_layer_calls_ir_op(layer, ir_op, x)
