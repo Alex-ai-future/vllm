@@ -7,12 +7,14 @@ import pytest
 import torch
 
 from tests.kernels.allclose_default import get_default_atol, get_default_rtol
-from tests.kernels.utils import opcheck
+from tests.kernels.utils import assert_pluggable_layer_calls_ir_op, opcheck
+from vllm import ir
 from vllm.model_executor.layers.activation import (
-    FastGELU,
     FatreluAndMul,
+    GELU,
     GeluAndMul,
     MulAndSilu,
+    FastGELU,
     NewGELU,
     QuickGELU,
     SiluAndMul,
@@ -31,13 +33,15 @@ CUDA_DEVICES = [
 ]
 
 
+# TODO: This test validates kernel output correctness, which overlaps with
+# the ir.ops routing tests. As custom ops are migrated to PluggableLayer,
+# remove cases from here and add them to ACTIVATION_LAYER_CONFIGS.
+# Eventually, test_activation_ir_op_routing will be the single source of truth.
 @pytest.mark.parametrize(
     "activation",
     [
         "silu_and_mul",
         "mul_and_silu",
-        "gelu",
-        "gelu_tanh",
         "fatrelu",
         "swigluoai_and_mul",
         "swiglustep_and_mul",
@@ -67,12 +71,6 @@ def test_act_and_mul(
     if activation == "mul_and_silu":
         layer = MulAndSilu()
         fn = torch.ops._C.mul_and_silu
-    elif activation == "gelu":
-        layer = GeluAndMul(approximate="none")
-        fn = torch.ops._C.gelu_and_mul
-    elif activation == "gelu_tanh":
-        layer = GeluAndMul(approximate="tanh")
-        fn = torch.ops._C.gelu_tanh_and_mul
     elif activation == "fatrelu":
         threshold = random.uniform(0, 1)
         layer = FatreluAndMul(threshold)
@@ -116,39 +114,42 @@ def test_act_and_mul(
         opcheck(fn, (out, x))
 
 
-@pytest.mark.parametrize(
-    "activation",
-    [
-        (FastGELU, torch.ops._C.gelu_fast),
-        (NewGELU, torch.ops._C.gelu_new),
-        (QuickGELU, torch.ops._C.gelu_quick),
-    ],
-)
+# Activation layer test configs (currently only GELU variants)
+ACTIVATION_LAYER_CONFIGS = [
+    ("GELU", GELU, ir.ops.gelu, {}),
+    ("GeluAndMul_none", GeluAndMul, ir.ops.gelu_and_mul, {"approximate": "none"}),
+    ("GeluAndMul_tanh", GeluAndMul, ir.ops.gelu_and_mul, {"approximate": "tanh"}),
+    ("NewGELU", NewGELU, ir.ops.gelu_new, {}),
+    ("FastGELU", FastGELU, ir.ops.gelu_fast, {}),
+    ("QuickGELU", QuickGELU, ir.ops.quick_gelu, {}),
+]
+
+
+# This test verifies that PluggableLayer instances correctly dispatch to
+# their corresponding ir.ops functions. Add new activations to
+# ACTIVATION_LAYER_CONFIGS to automatically get test coverage.
+@pytest.mark.parametrize("name, layer_cls, ir_op, kwargs", ACTIVATION_LAYER_CONFIGS)
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
 @pytest.mark.parametrize("d", D)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
-def test_activation(
+def test_activation_ir_op_routing(
     default_vllm_config,
-    activation: type[torch.nn.Module],
+    name: str,
+    layer_cls: type,
+    ir_op,
+    kwargs: dict,
     num_tokens: int,
     d: int,
     dtype: torch.dtype,
     seed: int,
     device: str,
 ) -> None:
+    """Test that activation PluggableLayer instances call the corresponding ir.ops function."""
     set_random_seed(seed)
     torch.set_default_device(device)
     x = torch.randn(num_tokens, d, dtype=dtype)
-    layer = activation[0]()
-    fn = activation[1]
-    out = layer(x)
-    ref_out = layer.forward_native(x)
-    torch.testing.assert_close(
-        out, ref_out, atol=get_default_atol(out), rtol=get_default_rtol(out)
-    )
-
-    out = torch.empty_like(x)
-    opcheck(fn, (out, x))
+    layer = layer_cls(**kwargs)
+    assert_pluggable_layer_calls_ir_op(layer, ir_op, x)
