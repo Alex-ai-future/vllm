@@ -132,20 +132,24 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
 
     rank = region.rank
 
+    _t0 = time.perf_counter()
     base_ptr = region._base.data_ptr()
     result = torch.cuda.cudart().cudaHostRegister(base_ptr, region.total_size_bytes, 0)
     if result.value != 0:
         logger.warning(
             "cudaHostRegister failed for rank=%d (code=%d) — "
-            "transfers will still work but may be slower (unpinned DMA)",
+            "transfers will still work but may be slower (unpinned DMA); "
+            "elapsed %.3f s",
             rank,
             result,
+            time.perf_counter() - _t0,
         )
     else:
         logger.debug(
-            "cudaHostRegister rank=%d %.2f GB",
+            "cudaHostRegister rank=%d %.2f GB in %.3f s",
             rank,
             region.total_size_bytes / 1e9,
+            time.perf_counter() - _t0,
         )
         region.is_pinned = True
 
@@ -510,6 +514,16 @@ class CPUOffloadingWorker(OffloadingWorker):
 
             gpu_tensors.append(gpu_tensor)
             cpu_tensors.append(cpu_tensor)
+
+        if mmap_region is not None:
+            try:
+                mmap_region.wait_for_madvise()
+            except Exception:
+                # The views in this local list keep the mmap storage alive.
+                # Release them before cleanup reclaims the mapped region.
+                cpu_tensors.clear()
+                mmap_region.cleanup()
+                raise
 
         self._store_handler = SingleDirectionOffloadingHandler(
             gpu_tensors=gpu_tensors,

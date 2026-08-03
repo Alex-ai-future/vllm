@@ -30,8 +30,58 @@ NUM_TENSORS = [4]
 SEEDS = [0]
 DEVICE_TYPE = current_platform.device_type
 DEVICES = [f"{DEVICE_TYPE}:0"]
+PAGE_SIZE = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
 NUM_MAPPINGS = [3]
 NUM_MAPPINGS_PER_GROUP = [2]
+
+
+def test_worker_propagates_madvise_error_before_handlers(monkeypatch):
+    """Population errors must be raised before transfer handlers are created."""
+    events = []
+
+    class FakeRegion:
+        def create_next_view(self, tensor_page_size):
+            events.append("view")
+            return torch.zeros((1, tensor_page_size), dtype=torch.int8)
+
+        def wait_for_madvise(self):
+            events.append("wait")
+            raise RuntimeError("population failed")
+
+        def cleanup(self):
+            events.append("cleanup")
+
+    class UnexpectedHandler:
+        def __init__(self, *args, **kwargs):
+            pytest.fail("transfer handlers must not be created after population fails")
+
+    monkeypatch.setattr(gpu_worker, "PIN_MEMORY", False)
+    monkeypatch.setattr(
+        gpu_worker, "SingleDirectionOffloadingHandler", UnexpectedHandler
+    )
+
+    gpu_tensor = torch.zeros((1, PAGE_SIZE), dtype=torch.int8)
+    kv_caches = CanonicalKVCaches(
+        tensors=[
+            CanonicalKVCacheTensor(
+                tensor=gpu_tensor,
+                page_size_bytes=PAGE_SIZE,
+            )
+        ],
+        group_data_refs=[
+            [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=PAGE_SIZE)]
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="population failed"):
+        CPUOffloadingWorker(
+            kv_caches=kv_caches,
+            blocks_per_chunk=1,
+            num_cpu_blocks=1,
+            mmap_region=FakeRegion(),
+        )
+
+    assert events == ["view", "wait", "cleanup"]
 
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-specific test")

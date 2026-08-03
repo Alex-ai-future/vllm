@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import mmap
 import os
+import threading
 import time
 
 import torch
@@ -56,6 +57,8 @@ class SharedOffloadRegion:
         self.mmap_path = f"/dev/shm/vllm_offload_{engine_id}.mmap"
         self._creator = False  # set True only if this worker creates the file
         self.rank = rank
+        self._madvise_thread: threading.Thread | None = None
+        self._madvise_error: Exception | None = None
         if rank is not None:
             # byte offset to this worker's first slot within each block row
             self._worker_offset = rank * cpu_page_size
@@ -88,23 +91,12 @@ class SharedOffloadRegion:
         # MADV_POPULATE_WRITE was added in Linux 5.14 (value 23).
         _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
         if rank is not None:
-            # Populate only this worker's pages (one slot per block row).
-            worker_offset = rank * cpu_page_size
-            _t0 = time.perf_counter()
-            page_size = self.page_size
-            for block in range(num_blocks):
-                raw_offset = block * self._row_stride + worker_offset
-                aligned_offset = (raw_offset // page_size) * page_size
-                end = raw_offset + cpu_page_size
-                aligned_length = end - aligned_offset
-                self.mmap_obj.madvise(
-                    _MADV_POPULATE_WRITE, aligned_offset, aligned_length
-                )
-            logger.debug(
-                "MADV_POPULATE_WRITE loop: %d blocks in %.3f s",
-                num_blocks,
-                time.perf_counter() - _t0,
+            self._madvise_thread = threading.Thread(
+                target=self._populate_worker_pages,
+                args=(_MADV_POPULATE_WRITE, rank * cpu_page_size, cpu_page_size),
+                name=f"SharedOffloadRegionMadvise-{rank}",
             )
+            self._madvise_thread.start()
         else:
             # No rank — populate the entire shared region in one call.
             _t0 = time.perf_counter()
@@ -116,6 +108,51 @@ class SharedOffloadRegion:
         self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
         self._views: list[torch.Tensor] = []
         self.is_pinned: bool = False
+
+    def _populate_worker_pages(
+        self, advice: int, worker_offset: int, cpu_page_size: int
+    ) -> None:
+        """Populate this worker's pages in the background."""
+        _t0 = time.perf_counter()
+        try:
+            page_size = self.page_size
+            for block in range(self.num_blocks):
+                raw_offset = block * self._row_stride + worker_offset
+                aligned_offset = (raw_offset // page_size) * page_size
+                end = raw_offset + cpu_page_size
+                aligned_length = end - aligned_offset
+                assert self.mmap_obj is not None
+                self.mmap_obj.madvise(advice, aligned_offset, aligned_length)
+        except Exception as exc:
+            self._madvise_error = exc
+            logger.warning(
+                "MADV_POPULATE_WRITE loop failed for rank=%d",
+                self.rank,
+                exc_info=True,
+            )
+        else:
+            logger.debug(
+                "MADV_POPULATE_WRITE loop: %d blocks in %.3f s",
+                self.num_blocks,
+                time.perf_counter() - _t0,
+            )
+
+    def wait_for_madvise(self) -> None:
+        """Wait for background population and re-raise its exception, if any."""
+        _t0 = time.perf_counter()
+        if self._madvise_thread is not None:
+            self._madvise_thread.join()
+            self._madvise_thread = None
+            logger.debug(
+                "Waited for MADV_POPULATE_WRITE rank=%d: %.3f s",
+                self.rank,
+                time.perf_counter() - _t0,
+            )
+
+        if self._madvise_error is not None:
+            error = self._madvise_error
+            self._madvise_error = None
+            raise error
 
     def create_next_view(self, tensor_page_size: int) -> torch.Tensor:
         """Allocate a strided int8 view for this worker, one canonical tensor.
@@ -171,6 +208,21 @@ class SharedOffloadRegion:
         return memoryview(np_arr)
 
     def cleanup(self) -> None:
+        if self._madvise_thread is not None:
+            self._madvise_thread.join()
+            self._madvise_thread = None
+        if self._madvise_error is not None:
+            logger.warning(
+                "Background MADV_POPULATE_WRITE failed before cleanup for rank=%d",
+                self.rank,
+                exc_info=(
+                    type(self._madvise_error),
+                    self._madvise_error,
+                    self._madvise_error.__traceback__,
+                ),
+            )
+            self._madvise_error = None
+
         if self.is_pinned and self._base is not None:
             if current_platform.is_cuda_alike():
                 base_ptr = self._base.data_ptr()

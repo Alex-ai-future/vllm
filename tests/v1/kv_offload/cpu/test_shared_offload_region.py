@@ -3,6 +3,7 @@
 """Unit tests for SharedOffloadRegion."""
 
 import contextlib
+import errno
 import mmap
 import os
 import threading
@@ -402,6 +403,64 @@ def test_file_has_correct_size(iid):
     """The mmap file size on disk must equal total_size_bytes."""
     with _region(iid, num_blocks=4) as r:
         assert os.path.getsize(r.mmap_path) == 4 * PAGE_SIZE
+
+
+def test_ranked_madvise_runs_in_background(iid, monkeypatch):
+    """Ranked construction must return while population is still running."""
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingMmap(mmap.mmap):
+        def madvise(self, *args):
+            started.set()
+            assert release.wait(timeout=5)
+
+    monkeypatch.setattr(mmap, "mmap", BlockingMmap)
+    region = _make_region(iid)
+    try:
+        assert started.wait(timeout=5)
+        assert region._madvise_thread is not None
+        assert region._madvise_thread.is_alive()
+    finally:
+        release.set()
+        region.cleanup()
+
+
+def test_ranked_madvise_preserves_block_ranges(iid, monkeypatch):
+    """Background population must preserve the existing per-block ranges."""
+
+    class TrackingMmap(mmap.mmap):
+        calls = []
+
+        def madvise(self, *args):
+            self.calls.append(args)
+
+    monkeypatch.setattr(mmap, "mmap", TrackingMmap)
+    with _region(iid, num_blocks=3, num_workers=2, rank=1) as region:
+        region.wait_for_madvise()
+
+    assert TrackingMmap.calls == [
+        (23, PAGE_SIZE, PAGE_SIZE),
+        (23, 3 * PAGE_SIZE, PAGE_SIZE),
+        (23, 5 * PAGE_SIZE, PAGE_SIZE),
+    ]
+
+
+def test_madvise_error_is_rethrown_by_wait(iid, monkeypatch):
+    """A background population error must retain its original errno."""
+
+    class FailingMmap(mmap.mmap):
+        def madvise(self, *args):
+            raise OSError(errno.EIO, "population failed")
+
+    monkeypatch.setattr(mmap, "mmap", FailingMmap)
+    region = _make_region(iid)
+    try:
+        with pytest.raises(OSError, match="population failed") as exc_info:
+            region.wait_for_madvise()
+        assert exc_info.value.errno == errno.EIO
+    finally:
+        region.cleanup()
 
 
 # ---------------------------------------------------------------------------
