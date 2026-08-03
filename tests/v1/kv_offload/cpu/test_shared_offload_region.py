@@ -40,6 +40,7 @@ def _make_region(
     cpu_page_size: int = PAGE_SIZE,
     num_workers: int = 1,
     rank: int = 0,
+    async_population: bool = False,
 ) -> SharedOffloadRegion:
     assert cpu_page_size % PAGE_SIZE == 0
     return SharedOffloadRegion(
@@ -48,6 +49,7 @@ def _make_region(
         rank=rank,
         kv_bytes_per_block=num_workers * cpu_page_size,
         cpu_page_size=cpu_page_size,
+        async_population=async_population,
     )
 
 
@@ -416,13 +418,31 @@ def test_ranked_madvise_runs_in_background(iid, monkeypatch):
             assert release.wait(timeout=5)
 
     monkeypatch.setattr(mmap, "mmap", BlockingMmap)
-    region = _make_region(iid)
+    region = _make_region(iid, async_population=True)
     try:
         assert started.wait(timeout=5)
-        assert region._madvise_thread is not None
-        assert region._madvise_thread.is_alive()
+        assert region._population_thread is not None
+        assert region._population_thread.is_alive()
     finally:
         release.set()
+        region.cleanup()
+
+
+def test_ranked_population_is_synchronous_by_default(iid, monkeypatch):
+    """Existing region users must retain synchronous construction semantics."""
+
+    class TrackingMmap(mmap.mmap):
+        calls = []
+
+        def madvise(self, *args):
+            self.calls.append(args)
+
+    monkeypatch.setattr(mmap, "mmap", TrackingMmap)
+    region = _make_region(iid)
+    try:
+        assert region._population_thread is None
+        assert TrackingMmap.calls == [(23, 0, PAGE_SIZE)]
+    finally:
         region.cleanup()
 
 
@@ -436,8 +456,10 @@ def test_ranked_madvise_preserves_block_ranges(iid, monkeypatch):
             self.calls.append(args)
 
     monkeypatch.setattr(mmap, "mmap", TrackingMmap)
-    with _region(iid, num_blocks=3, num_workers=2, rank=1) as region:
-        region.wait_for_madvise()
+    with _region(
+        iid, num_blocks=3, num_workers=2, rank=1, async_population=True
+    ) as region:
+        region.wait_for_population()
 
     assert TrackingMmap.calls == [
         (23, PAGE_SIZE, PAGE_SIZE),
@@ -454,10 +476,10 @@ def test_madvise_error_is_rethrown_by_wait(iid, monkeypatch):
             raise OSError(errno.EIO, "population failed")
 
     monkeypatch.setattr(mmap, "mmap", FailingMmap)
-    region = _make_region(iid)
+    region = _make_region(iid, async_population=True)
     try:
         with pytest.raises(OSError, match="population failed") as exc_info:
-            region.wait_for_madvise()
+            region.wait_for_population()
         assert exc_info.value.errno == errno.EIO
     finally:
         region.cleanup()

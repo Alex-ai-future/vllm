@@ -44,7 +44,7 @@ def test_worker_propagates_madvise_error_before_handlers(monkeypatch):
             events.append("view")
             return torch.zeros((1, tensor_page_size), dtype=torch.int8)
 
-        def wait_for_madvise(self):
+        def wait_for_population(self):
             events.append("wait")
             raise RuntimeError("population failed")
 

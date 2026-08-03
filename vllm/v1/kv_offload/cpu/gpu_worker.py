@@ -514,10 +514,11 @@ class CPUOffloadingWorker(OffloadingWorker):
 
             gpu_tensors.append(gpu_tensor)
             cpu_tensors.append(cpu_tensor)
+            del cpu_tensor
 
         if mmap_region is not None:
             try:
-                mmap_region.wait_for_madvise()
+                mmap_region.wait_for_population()
             except Exception:
                 # The views in this local list keep the mmap storage alive.
                 # Release them before cleanup reclaims the mapped region.

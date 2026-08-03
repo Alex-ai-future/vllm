@@ -236,6 +236,7 @@ def test_tiering_spec_create_worker_uses_single_slot_for_replicated_layout(monke
 
     assert region_calls[0]["rank"] == 0
     assert region_calls[0]["kv_bytes_per_block"] == worker_kv_bytes_per_block
+    assert region_calls[0]["async_population"] is True
     assert worker_calls[0]["kv_caches"] is kv_caches
     assert worker_calls[0]["mmap_region"] is region
 
@@ -378,6 +379,7 @@ def test_cpu_spec_create_worker_uses_mmap_on_cuda_alike(monkeypatch):
 
     assert region_calls[0]["engine_id"] == "test-engine"
     assert region_calls[0]["kv_bytes_per_block"] == worker_kv_bytes_per_block * 4
+    assert region_calls[0]["async_population"] is True
     assert worker_calls[0]["kv_caches"] is kv_caches
     assert worker_calls[0]["mmap_region"] is region
 
