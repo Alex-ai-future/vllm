@@ -438,7 +438,7 @@ def test_ranked_population_is_synchronous_by_default(iid, monkeypatch):
             self.calls.append(args)
 
     monkeypatch.setattr(mmap, "mmap", TrackingMmap)
-    region = _make_region(iid)
+    region = _make_region(iid, num_blocks=1)
     try:
         assert region._population_thread is None
         assert TrackingMmap.calls == [(23, 0, PAGE_SIZE)]
@@ -477,6 +477,23 @@ def test_madvise_error_is_rethrown_by_wait(iid, monkeypatch):
 
     monkeypatch.setattr(mmap, "mmap", FailingMmap)
     region = _make_region(iid, async_population=True)
+    try:
+        with pytest.raises(OSError, match="population failed") as exc_info:
+            region.wait_for_population()
+        assert exc_info.value.errno == errno.EIO
+    finally:
+        region.cleanup()
+
+
+def test_synchronous_population_error_is_deferred_to_wait(iid, monkeypatch):
+    """Synchronous population errors stay available for TP error propagation."""
+
+    class FailingMmap(mmap.mmap):
+        def madvise(self, *args):
+            raise OSError(errno.EIO, "population failed")
+
+    monkeypatch.setattr(mmap, "mmap", FailingMmap)
+    region = _make_region(iid, num_blocks=1)
     try:
         with pytest.raises(OSError, match="population failed") as exc_info:
             region.wait_for_population()

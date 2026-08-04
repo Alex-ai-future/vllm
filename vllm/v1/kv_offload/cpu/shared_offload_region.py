@@ -48,6 +48,7 @@ class SharedOffloadRegion:
         cpu_page_size: int,
         async_population: bool = False,
     ) -> None:
+        self.initialization_start_time = time.perf_counter()
         self.page_size = mmap.PAGESIZE
         assert kv_bytes_per_block % self.page_size == 0
 
@@ -60,6 +61,12 @@ class SharedOffloadRegion:
         self.rank = rank
         self._population_thread: threading.Thread | None = None
         self._population_error: Exception | None = None
+        self.population_time_s = 0.0
+        self.population_wait_time_s = 0.0
+        self.population_barrier_wait_time_s = 0.0
+        self.register_time_s = 0.0
+        self.ready_barrier_wait_time_s = 0.0
+        self.initialization_time_s = 0.0
         if rank is not None:
             # byte offset to this worker's first slot within each block row
             self._worker_offset = rank * cpu_page_size
@@ -100,15 +107,20 @@ class SharedOffloadRegion:
                 )
                 self._population_thread.start()
             else:
-                self._populate_worker_pages(
+                # Keep the mapping alive after a population failure so the
+                # worker can report the failure through the TP collective.
+                # Raising here would leave other ranks waiting forever at the
+                # collective.
+                self._run_population_in_background(
                     _MADV_POPULATE_WRITE, rank * cpu_page_size, cpu_page_size
                 )
         else:
             # No rank — populate the entire shared region in one call.
             _t0 = time.perf_counter()
             self.mmap_obj.madvise(_MADV_POPULATE_WRITE, 0, self.total_size_bytes)
+            self.population_time_s = time.perf_counter() - _t0
             logger.debug(
-                "MADV_POPULATE_WRITE entire region: %.3f s", time.perf_counter() - _t0
+                "MADV_POPULATE_WRITE entire region: %.3f s", self.population_time_s
             )
 
         self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
@@ -120,18 +132,22 @@ class SharedOffloadRegion:
     ) -> None:
         """Populate this worker's pages."""
         _t0 = time.perf_counter()
-        page_size = self.page_size
-        for block in range(self.num_blocks):
-            raw_offset = block * self._row_stride + worker_offset
-            aligned_offset = (raw_offset // page_size) * page_size
-            end = raw_offset + cpu_page_size
-            aligned_length = end - aligned_offset
-            assert self.mmap_obj is not None
-            self.mmap_obj.madvise(advice, aligned_offset, aligned_length)
+        try:
+            page_size = self.page_size
+            for block in range(self.num_blocks):
+                raw_offset = block * self._row_stride + worker_offset
+                aligned_offset = (raw_offset // page_size) * page_size
+                end = raw_offset + cpu_page_size
+                aligned_length = end - aligned_offset
+                assert self.mmap_obj is not None
+                self.mmap_obj.madvise(advice, aligned_offset, aligned_length)
+        finally:
+            self.population_time_s = time.perf_counter() - _t0
+
         logger.debug(
             "MADV_POPULATE_WRITE loop: %d blocks in %.3f s",
             self.num_blocks,
-            time.perf_counter() - _t0,
+            self.population_time_s,
         )
 
     def _run_population_in_background(
@@ -150,13 +166,17 @@ class SharedOffloadRegion:
     def wait_for_population(self) -> None:
         """Wait for page population and re-raise its exception, if any."""
         _t0 = time.perf_counter()
-        if self._population_thread is not None:
+        had_thread = self._population_thread is not None
+        if had_thread:
             self._population_thread.join()
             self._population_thread = None
+        wait_time = time.perf_counter() - _t0
+        self.population_wait_time_s += wait_time
+        if had_thread:
             logger.debug(
                 "Waited for mmap page population rank=%d: %.3f s",
                 self.rank,
-                time.perf_counter() - _t0,
+                wait_time,
             )
 
         if self._population_error is not None:

@@ -164,7 +164,6 @@ class CPUOffloadingSpec(OffloadingSpec):
                 rank=rank,
                 kv_bytes_per_block=self.kv_bytes_per_chunk,
                 cpu_page_size=self.cpu_page_size_per_worker,
-                async_population=True,
             )
         return CPUOffloadingWorker(
             kv_caches=kv_caches,

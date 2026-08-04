@@ -9,6 +9,10 @@ import numpy as np
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.distributed.parallel_state import (
+    get_tp_group,
+    model_parallel_is_initialized,
+)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, triton
@@ -120,9 +124,66 @@ def compute_sub_block_ptrs(
     output[:] = flat[skip_count : skip_count + num_sub_blocks]
 
 
+def _get_tp_group_for_initialization():
+    """Return the initialized TP group, if this process has one."""
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return None
+    if not model_parallel_is_initialized():
+        return None
+    return get_tp_group()
+
+
+def _raise_collective_initialization_error(
+    local_error: Exception | None, phase: str, tp_group
+) -> None:
+    """Raise a local or peer initialization error without stranding ranks."""
+    if tp_group is None or tp_group.world_size == 1:
+        if local_error is not None:
+            raise local_error
+        return
+
+    failed = torch.tensor(
+        [int(local_error is not None)], dtype=torch.int32, device="cpu"
+    )
+    torch.distributed.all_reduce(
+        failed, op=torch.distributed.ReduceOp.MAX, group=tp_group.cpu_group
+    )
+    if failed.item() == 0:
+        return
+
+    if local_error is not None:
+        raise local_error
+    raise RuntimeError(f"{phase} failed on another TP rank")
+
+
+def _tp_barrier(tp_group, phase: str) -> float:
+    """Synchronize TP ranks and return the time spent waiting."""
+    if tp_group is None or tp_group.world_size == 1:
+        return 0.0
+
+    start = time.perf_counter()
+    tp_group.barrier()
+    elapsed = time.perf_counter() - start
+    logger.debug("CPU offload %s barrier waited %.3f s", phase, elapsed)
+    return elapsed
+
+
+def _tp_max_time(tp_group, elapsed: float) -> float:
+    """Return the largest elapsed time across TP ranks."""
+    if tp_group is None or tp_group.world_size == 1:
+        return elapsed
+
+    value = torch.tensor([elapsed], dtype=torch.float64, device="cpu")
+    torch.distributed.all_reduce(
+        value, op=torch.distributed.ReduceOp.MAX, group=tp_group.cpu_group
+    )
+    return float(value.item())
+
+
 def pin_mmap_region(region: SharedOffloadRegion) -> None:
     """Register the entire mmap as CUDA pinned memory via cudaHostRegister."""
     if not current_platform.is_cuda_alike():
+        region.register_time_s = 0.0
         logger.info(
             "Skipping mmap host registration on %s; cudaHostRegister is only "
             "available on CUDA/ROCm.",
@@ -134,22 +195,29 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
 
     _t0 = time.perf_counter()
     base_ptr = region._base.data_ptr()
-    result = torch.cuda.cudart().cudaHostRegister(base_ptr, region.total_size_bytes, 0)
+    try:
+        result = torch.cuda.cudart().cudaHostRegister(
+            base_ptr, region.total_size_bytes, 0
+        )
+    finally:
+        region.register_time_s = time.perf_counter() - _t0
     if result.value != 0:
         logger.warning(
             "cudaHostRegister failed for rank=%d (code=%d) — "
-            "transfers will still work but may be slower (unpinned DMA); "
-            "elapsed %.3f s",
+            "the offload worker will not start; elapsed %.3f s",
             rank,
             result,
-            time.perf_counter() - _t0,
+            region.register_time_s,
+        )
+        raise RuntimeError(
+            f"cudaHostRegister failed for rank={rank} with error code {result.value}"
         )
     else:
         logger.debug(
             "cudaHostRegister rank=%d %.2f GB in %.3f s",
             rank,
             region.total_size_bytes / 1e9,
-            time.perf_counter() - _t0,
+            region.register_time_s,
         )
         region.is_pinned = True
 
@@ -482,21 +550,25 @@ class CPUOffloadingWorker(OffloadingWorker):
     ):
         pin_memory = PIN_MEMORY
         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
-        if mmap_region is not None and pin_memory:
-            pin_mmap_region(mmap_region)
+        tp_group = _get_tp_group_for_initialization() if mmap_region else None
+        mmap_init_start = (
+            getattr(mmap_region, "initialization_start_time", time.perf_counter())
+            if mmap_region is not None
+            else None
+        )
 
         gpu_tensors: list[torch.Tensor] = []
         cpu_tensors: list[torch.Tensor] = []
+        cpu_page_sizes: list[int] = []
         for kv_cache_tensor in kv_caches.tensors:
             gpu_page_size_bytes = kv_cache_tensor.page_size_bytes
             gpu_tensor = kv_cache_tensor.tensor.view(torch.int8).view(
                 (-1, gpu_page_size_bytes)
             )
             cpu_page_size_bytes = gpu_page_size_bytes * blocks_per_chunk
+            cpu_page_sizes.append(cpu_page_size_bytes)
 
-            if mmap_region is not None:
-                cpu_tensor = mmap_region.create_next_view(cpu_page_size_bytes)
-            else:
+            if mmap_region is None:
                 t0 = time.monotonic()
                 cpu_tensor = torch.zeros(
                     (num_cpu_blocks, cpu_page_size_bytes),
@@ -511,20 +583,94 @@ class CPUOffloadingWorker(OffloadingWorker):
                     num_cpu_blocks * cpu_page_size_bytes / 1e9,
                     time.monotonic() - t0,
                 )
-
             gpu_tensors.append(gpu_tensor)
-            cpu_tensors.append(cpu_tensor)
-            del cpu_tensor
+            if mmap_region is None:
+                cpu_tensors.append(cpu_tensor)
+                del cpu_tensor
 
         if mmap_region is not None:
+            population_error: Exception | None = None
             try:
                 mmap_region.wait_for_population()
+            except Exception as exc:
+                population_error = exc
+
+            try:
+                _raise_collective_initialization_error(
+                    population_error, "mmap population", tp_group
+                )
             except Exception:
-                # The views in this local list keep the mmap storage alive.
-                # Release them before cleanup reclaims the mapped region.
+                # Release any partially-created views before cleanup reclaims
+                # the mapped region.
                 cpu_tensors.clear()
                 mmap_region.cleanup()
                 raise
+
+            mmap_region.population_barrier_wait_time_s = _tp_barrier(
+                tp_group, "population"
+            )
+
+            register_error: Exception | None = None
+            if pin_memory:
+                try:
+                    pin_mmap_region(mmap_region)
+                except Exception as exc:
+                    register_error = exc
+
+            try:
+                _raise_collective_initialization_error(
+                    register_error, "cudaHostRegister", tp_group
+                )
+            except Exception:
+                # A peer may have registered successfully before another rank
+                # failed. Cleanup unregisters that peer before it exits.
+                cpu_tensors.clear()
+                mmap_region.cleanup()
+                raise
+
+            view_error: Exception | None = None
+            for cpu_page_size_bytes in cpu_page_sizes:
+                try:
+                    cpu_tensors.append(
+                        mmap_region.create_next_view(cpu_page_size_bytes)
+                    )
+                except Exception as exc:
+                    view_error = exc
+                    break
+
+            try:
+                _raise_collective_initialization_error(
+                    view_error, "mmap tensor view creation", tp_group
+                )
+            except Exception:
+                cpu_tensors.clear()
+                mmap_region.cleanup()
+                raise
+
+            mmap_region.ready_barrier_wait_time_s = _tp_barrier(
+                tp_group, "ready"
+            )
+            mmap_region.initialization_time_s = (
+                time.perf_counter() - mmap_init_start
+                if mmap_init_start is not None
+                else 0.0
+            )
+            max_initialization_time = _tp_max_time(
+                tp_group, mmap_region.initialization_time_s
+            )
+            logger.info(
+                "CPU offload mmap initialized rank=%d: population=%.3f s, "
+                "population_barrier=%.3f s, register=%.3f s, "
+                "ready_barrier=%.3f s, total=%.3f s, "
+                "tp_max=%.3f s",
+                mmap_region.rank,
+                mmap_region.population_time_s,
+                mmap_region.population_barrier_wait_time_s,
+                mmap_region.register_time_s,
+                mmap_region.ready_barrier_wait_time_s,
+                mmap_region.initialization_time_s,
+                max_initialization_time,
+            )
 
         self._store_handler = SingleDirectionOffloadingHandler(
             gpu_tensors=gpu_tensors,

@@ -3,6 +3,7 @@
 import random
 import time
 import uuid
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -33,6 +34,53 @@ DEVICES = [f"{DEVICE_TYPE}:0"]
 PAGE_SIZE = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
 NUM_MAPPINGS = [3]
 NUM_MAPPINGS_PER_GROUP = [2]
+
+
+def test_registration_failure_is_fatal(monkeypatch):
+    """A failed cudaHostRegister must prevent the worker from starting."""
+
+    class FakeResult(int):
+        @property
+        def value(self):
+            return int(self)
+
+    class FakeCudart:
+        def cudaHostRegister(self, *args):
+            return FakeResult(7)
+
+    region = SimpleNamespace(
+        _base=SimpleNamespace(data_ptr=lambda: 1234),
+        total_size_bytes=PAGE_SIZE,
+        rank=0,
+        register_time_s=0.0,
+        is_pinned=False,
+    )
+    monkeypatch.setattr(gpu_worker.current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: FakeCudart())
+
+    with pytest.raises(RuntimeError, match="cudaHostRegister failed"):
+        gpu_worker.pin_mmap_region(region)
+
+    assert not region.is_pinned
+    assert region.register_time_s >= 0
+
+
+def test_collective_peer_failure_is_propagated(monkeypatch):
+    """A peer population/register failure must reach every TP rank."""
+
+    class FakeGroup:
+        world_size = 2
+        cpu_group = object()
+
+    def all_reduce(tensor, **kwargs):
+        tensor.fill_(1)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+
+    with pytest.raises(RuntimeError, match="another TP rank"):
+        gpu_worker._raise_collective_initialization_error(
+            None, "cudaHostRegister", FakeGroup()
+        )
 
 
 def test_worker_propagates_madvise_error_before_handlers(monkeypatch):
@@ -81,7 +129,7 @@ def test_worker_propagates_madvise_error_before_handlers(monkeypatch):
             mmap_region=FakeRegion(),
         )
 
-    assert events == ["view", "wait", "cleanup"]
+    assert events == ["wait", "cleanup"]
 
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-specific test")
