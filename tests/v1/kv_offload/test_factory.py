@@ -237,6 +237,7 @@ def test_tiering_spec_create_worker_uses_single_slot_for_replicated_layout(monke
     assert region_calls[0]["rank"] == 0
     assert region_calls[0]["kv_bytes_per_block"] == worker_kv_bytes_per_block
     assert region_calls[0].get("async_population", False) is False
+    assert region_calls[0].get("rank_local_registration", False) is False
     assert worker_calls[0]["kv_caches"] is kv_caches
     assert worker_calls[0]["mmap_region"] is region
 
@@ -268,6 +269,34 @@ def test_tiering_spec_create_worker_folds_device_index_for_sharded_layout(monkey
     spec.create_worker(MagicMock())
 
     assert region_calls[0]["rank"] == 1
+
+
+def test_tiering_spec_create_worker_passes_rank_local_registration(monkeypatch):
+    import vllm.v1.kv_offload.tiering.spec as tiering_spec_module
+
+    spec = _create_spec(
+        spec_name="TieringOffloadingSpec",
+        worker_kv_bytes_per_block=SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT,
+        world_size=2,
+        extra_config={"rank_local_registration": True},
+    )
+    assert isinstance(spec, TieringOffloadingSpec)
+
+    region_calls: list[dict[str, Any]] = []
+
+    def fake_region_ctor(**kwargs):
+        region_calls.append(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(tiering_spec_module, "SharedOffloadRegion", fake_region_ctor)
+    monkeypatch.setattr(tiering_spec_module, "CPUOffloadingWorker", MagicMock())
+    monkeypatch.setattr(
+        tiering_spec_module.torch.accelerator, "current_device_index", lambda: 1
+    )
+
+    spec.create_worker(MagicMock())
+
+    assert region_calls[0]["rank_local_registration"] is True
 
 
 @pytest.mark.parametrize("world_size", [2, 4, 8])
@@ -380,8 +409,35 @@ def test_cpu_spec_create_worker_uses_mmap_on_cuda_alike(monkeypatch):
     assert region_calls[0]["engine_id"] == "test-engine"
     assert region_calls[0]["kv_bytes_per_block"] == worker_kv_bytes_per_block * 4
     assert region_calls[0].get("async_population", False) is False
+    assert region_calls[0].get("rank_local_registration", False) is False
     assert worker_calls[0]["kv_caches"] is kv_caches
     assert worker_calls[0]["mmap_region"] is region
+
+
+def test_cpu_spec_create_worker_passes_rank_local_registration(monkeypatch):
+    import vllm.v1.kv_offload.cpu.spec as cpu_spec_module
+
+    worker_kv_bytes_per_block = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+    spec = _create_spec(
+        worker_kv_bytes_per_block=worker_kv_bytes_per_block,
+        world_size=4,
+        extra_config={"rank_local_registration": True},
+    )
+    assert isinstance(spec, CPUOffloadingSpec)
+
+    region_calls: list[dict[str, Any]] = []
+
+    def fake_region_ctor(**kwargs):
+        region_calls.append(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(cpu_spec_module.current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(cpu_spec_module, "SharedOffloadRegion", fake_region_ctor)
+    monkeypatch.setattr(cpu_spec_module, "CPUOffloadingWorker", MagicMock())
+
+    spec.create_worker(MagicMock())
+
+    assert region_calls[0]["rank_local_registration"] is True
 
 
 def test_cpu_spec_create_worker_uses_tensor_path_off_cuda_alike(monkeypatch):

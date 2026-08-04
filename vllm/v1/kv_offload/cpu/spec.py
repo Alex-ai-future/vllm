@@ -88,6 +88,10 @@ class CPUOffloadingSpec(OffloadingSpec):
         self.kv_bytes_per_chunk = 0
         self.cpu_page_size_per_worker = 0
         self.replicated_layout = config.replicated_layout and self._uses_shared_region()
+        # Experimental: register only page-aligned slices owned by each rank.
+        self.rank_local_registration = bool(
+            self.extra_config.get("rank_local_registration", False)
+        )
         if config.worker_kv_bytes_per_block > 0 and world_size > 0:
             num_copies = 1 if self.replicated_layout else world_size
             kv_bytes_per_block = config.worker_kv_bytes_per_block * num_copies
@@ -164,6 +168,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 rank=rank,
                 kv_bytes_per_block=self.kv_bytes_per_chunk,
                 cpu_page_size=self.cpu_page_size_per_worker,
+                rank_local_registration=self.rank_local_registration,
             )
         return CPUOffloadingWorker(
             kv_caches=kv_caches,

@@ -15,6 +15,9 @@ GPU="${GPU:-0}"
 REPEATS="${REPEATS:-5}"
 NUM_BLOCKS="${NUM_BLOCKS:-512}"
 ROW_SIZE_MIB="${ROW_SIZE_MIB:-2}"
+NUM_WORKERS="${NUM_WORKERS:-1}"
+RANK="${RANK:-0}"
+CANDIDATE_RANK_LOCAL_REGISTRATION="${CANDIDATE_RANK_LOCAL_REGISTRATION:-0}"
 REGION_SCRIPT="${CANDIDATE_DIR}/benchmarks/benchmark_async_madvise_region.py"
 
 for root in "${CANDIDATE_DIR}" "${BASELINE_DIR}"; do
@@ -54,6 +57,9 @@ fi
     echo "repeats=${REPEATS}"
     echo "num_blocks=${NUM_BLOCKS}"
     echo "row_size_mib=${ROW_SIZE_MIB}"
+    echo "num_workers=${NUM_WORKERS}"
+    echo "rank=${RANK}"
+    echo "candidate_rank_local_registration=${CANDIDATE_RANK_LOCAL_REGISTRATION}"
     echo "cuda_home=${CUDA_HOME}"
     echo "baseline=$(git -C "${BASELINE_DIR}" rev-parse HEAD)"
     echo "candidate=$(git -C "${CANDIDATE_DIR}" rev-parse HEAD)"
@@ -81,13 +87,21 @@ run_case() {
         echo "A previous run left a vLLM mmap file." >&2
         exit 3
     fi
+    local extra_args=(
+        --num-blocks "${NUM_BLOCKS}"
+        --row-size-mib "${ROW_SIZE_MIB}"
+        --num-workers "${NUM_WORKERS}"
+        --rank "${RANK}"
+        --repeats 1
+        --output-json "${output_json}"
+    )
+    if [[ "${label}" == "candidate" && "${CANDIDATE_RANK_LOCAL_REGISTRATION}" == "1" ]]; then
+        extra_args+=(--rank-local-registration)
+    fi
     if (
         cd "${root}"
         PYTHONPATH="${root}" "${root}/.venv/bin/python" "${REGION_SCRIPT}" \
-            --num-blocks "${NUM_BLOCKS}" \
-            --row-size-mib "${ROW_SIZE_MIB}" \
-            --repeats 1 \
-            --output-json "${output_json}"
+            "${extra_args[@]}"
     ) > "${output_log}" 2>&1; then
         :
     else

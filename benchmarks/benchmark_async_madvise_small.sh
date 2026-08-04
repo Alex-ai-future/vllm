@@ -19,6 +19,7 @@ WARMUP_ITERS="${WARMUP_ITERS:-1}"
 WARM_ITERS="${WARM_ITERS:-3}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-2048}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
+RANK_LOCAL_REGISTRATION="${RANK_LOCAL_REGISTRATION:-0}"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
     echo "This benchmark requires Linux." >&2
@@ -71,6 +72,7 @@ fi
     echo "warm_iters=${WARM_ITERS}"
     echo "max_model_len=${MAX_MODEL_LEN}"
     echo "enforce_eager=${ENFORCE_EAGER}"
+    echo "rank_local_registration=${RANK_LOCAL_REGISTRATION}"
     echo "kernel=$(uname -a)"
     echo "shm=$(df -h /dev/shm | tail -n 1)"
     echo "cuda_home=${CUDA_HOME}"
@@ -92,6 +94,12 @@ run_case() {
     local after_files=()
     if [[ "${ENFORCE_EAGER}" == "1" ]]; then
         extra_args+=(--enforce-eager)
+    fi
+    if [[ "${label}" == "candidate" && "${RANK_LOCAL_REGISTRATION}" == "1" ]]; then
+        extra_args+=(
+            --kv-transfer-config
+            '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"rank_local_registration":true}}'
+        )
     fi
 
     echo "Running ${label} run=${run_id}"

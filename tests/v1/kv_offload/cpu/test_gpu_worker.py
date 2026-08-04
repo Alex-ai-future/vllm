@@ -52,8 +52,16 @@ def test_registration_failure_is_fatal(monkeypatch):
         _base=SimpleNamespace(data_ptr=lambda: 1234),
         total_size_bytes=PAGE_SIZE,
         rank=0,
+        rank_local_registration=False,
         register_time_s=0.0,
         is_pinned=False,
+        _registered_ranges=[],
+        registration_call_count=0,
+        registered_bytes=0,
+        unregister_call_count=0,
+        unregister_time_s=0.0,
+        get_host_registration_ranges=lambda: [(0, PAGE_SIZE)],
+        unregister_host_registration=lambda: None,
     )
     monkeypatch.setattr(gpu_worker.current_platform, "is_cuda_alike", lambda: True)
     monkeypatch.setattr(torch.cuda, "cudart", lambda: FakeCudart())
@@ -63,6 +71,113 @@ def test_registration_failure_is_fatal(monkeypatch):
 
     assert not region.is_pinned
     assert region.register_time_s >= 0
+
+
+def test_rank_local_registration_registers_each_merged_range(monkeypatch):
+    class FakeResult(int):
+        @property
+        def value(self):
+            return int(self)
+
+    class FakeCudart:
+        def __init__(self):
+            self.register_calls = []
+
+        def cudaHostRegister(self, *args):
+            self.register_calls.append(args)
+            return FakeResult(0)
+
+    cudart = FakeCudart()
+    region = SimpleNamespace(
+        _base=SimpleNamespace(data_ptr=lambda: 1234),
+        total_size_bytes=4 * PAGE_SIZE,
+        rank=1,
+        rank_local_registration=True,
+        register_time_s=0.0,
+        is_pinned=False,
+        _registered_ranges=[],
+        registration_call_count=0,
+        registered_bytes=0,
+        unregister_call_count=0,
+        unregister_time_s=0.0,
+        get_host_registration_ranges=lambda: [
+            (PAGE_SIZE, PAGE_SIZE),
+            (3 * PAGE_SIZE, PAGE_SIZE),
+        ],
+        unregister_host_registration=lambda: None,
+    )
+
+    monkeypatch.setattr(gpu_worker.current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+
+    gpu_worker.pin_mmap_region(region)
+
+    assert cudart.register_calls == [
+        (1234 + PAGE_SIZE, PAGE_SIZE, 0),
+        (1234 + 3 * PAGE_SIZE, PAGE_SIZE, 0),
+    ]
+    assert region.registration_call_count == 2
+    assert region.registered_bytes == 2 * PAGE_SIZE
+    assert region.is_pinned
+
+
+def test_rank_local_registration_rolls_back_partial_failure(monkeypatch):
+    class FakeResult(int):
+        @property
+        def value(self):
+            return int(self)
+
+    class FakeCudart:
+        def __init__(self):
+            self.register_calls = 0
+            self.unregister_calls = []
+
+        def cudaHostRegister(self, *args):
+            self.register_calls += 1
+            return FakeResult(0 if self.register_calls == 1 else 7)
+
+        def cudaHostUnregister(self, ptr):
+            self.unregister_calls.append(ptr)
+            return FakeResult(0)
+
+    cudart = FakeCudart()
+    region = SimpleNamespace(
+        _base=SimpleNamespace(data_ptr=lambda: 1234),
+        total_size_bytes=4 * PAGE_SIZE,
+        rank=1,
+        rank_local_registration=True,
+        register_time_s=0.0,
+        is_pinned=False,
+        _registered_ranges=[],
+        registration_call_count=0,
+        registered_bytes=0,
+        unregister_call_count=0,
+        unregister_time_s=0.0,
+        get_host_registration_ranges=lambda: [
+            (PAGE_SIZE, PAGE_SIZE),
+            (3 * PAGE_SIZE, PAGE_SIZE),
+        ],
+    )
+
+    def unregister_host_registration():
+        for ptr, _ in reversed(region._registered_ranges):
+            cudart.cudaHostUnregister(ptr)
+        region._registered_ranges.clear()
+        region.registered_bytes = 0
+        region.is_pinned = False
+
+    region.unregister_host_registration = unregister_host_registration
+
+    monkeypatch.setattr(gpu_worker.current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+
+    with pytest.raises(RuntimeError, match="cudaHostRegister failed"):
+        gpu_worker.pin_mmap_region(region)
+
+    assert cudart.unregister_calls == [1234 + PAGE_SIZE]
+    assert region._registered_ranges == []
+    assert region.registered_bytes == 0
+    assert not region.is_pinned
 
 
 def test_collective_peer_failure_is_propagated(monkeypatch):

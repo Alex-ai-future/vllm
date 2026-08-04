@@ -41,6 +41,7 @@ def _make_region(
     num_workers: int = 1,
     rank: int = 0,
     async_population: bool = False,
+    rank_local_registration: bool = False,
 ) -> SharedOffloadRegion:
     assert cpu_page_size % PAGE_SIZE == 0
     return SharedOffloadRegion(
@@ -50,6 +51,7 @@ def _make_region(
         kv_bytes_per_block=num_workers * cpu_page_size,
         cpu_page_size=cpu_page_size,
         async_population=async_population,
+        rank_local_registration=rank_local_registration,
     )
 
 
@@ -196,6 +198,49 @@ def test_create_next_view_storage_offset_rank1(iid):
         t1 = r1.create_next_view(PAGE_SIZE)
         assert t1.data_ptr() == r1._base.data_ptr() + PAGE_SIZE
         del t1
+
+
+def test_rank_local_registration_ranges_cover_rank_slices(iid):
+    with _region(
+        iid,
+        num_blocks=3,
+        cpu_page_size=PAGE_SIZE,
+        num_workers=4,
+        rank=2,
+        rank_local_registration=True,
+    ) as region:
+        assert region.get_host_registration_ranges() == [
+            (2 * PAGE_SIZE, PAGE_SIZE),
+            (6 * PAGE_SIZE, PAGE_SIZE),
+            (10 * PAGE_SIZE, PAGE_SIZE),
+        ]
+
+
+def test_rank_local_registration_merges_contiguous_rows(iid):
+    with _region(
+        iid,
+        num_blocks=3,
+        cpu_page_size=PAGE_SIZE,
+        num_workers=1,
+        rank_local_registration=True,
+    ) as region:
+        assert region.get_host_registration_ranges() == [(0, 3 * PAGE_SIZE)]
+
+
+def test_rank_local_registration_falls_back_for_unaligned_slices(iid):
+    region = SharedOffloadRegion(
+        engine_id=iid,
+        num_blocks=2,
+        rank=1,
+        kv_bytes_per_block=PAGE_SIZE,
+        cpu_page_size=PAGE_SIZE // 2,
+        rank_local_registration=True,
+    )
+    try:
+        assert region.registration_mode == "full-fallback"
+        assert region.get_host_registration_ranges() == [(0, 2 * PAGE_SIZE)]
+    finally:
+        region.cleanup()
 
 
 def test_create_next_view_row_stride_with_multiple_workers(iid):

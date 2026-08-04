@@ -21,6 +21,8 @@ Configuration via kv_connector_extra_config:
       - type: (required) Type of secondary tier (e.g., "example", "storage", "network")
       - Additional tier-specific parameters are passed directly to the tier
         constructor. See each tier's documentation for supported parameters.
+  - rank_local_registration: (optional) Register only this rank's mmap slices
+    instead of the full shared mmap. Experimental; defaults to false.
 
 Example configuration:
 {
@@ -255,6 +257,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             rank=rank,
             kv_bytes_per_block=self.kv_bytes_per_chunk,
             cpu_page_size=self.cpu_page_size_per_worker,
+            rank_local_registration=self.rank_local_registration,
         )
         return CPUOffloadingWorker(
             kv_caches=kv_caches,

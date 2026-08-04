@@ -47,6 +47,7 @@ class SharedOffloadRegion:
         kv_bytes_per_block: int,
         cpu_page_size: int,
         async_population: bool = False,
+        rank_local_registration: bool = False,
     ) -> None:
         self.initialization_start_time = time.perf_counter()
         self.page_size = mmap.PAGESIZE
@@ -59,6 +60,24 @@ class SharedOffloadRegion:
         self.mmap_path = f"/dev/shm/vllm_offload_{engine_id}.mmap"
         self._creator = False  # set True only if this worker creates the file
         self.rank = rank
+        self.rank_local_registration = rank_local_registration
+        self._rank_local_registration_active = rank_local_registration and (
+            rank is not None and cpu_page_size % self.page_size == 0
+        )
+        if rank_local_registration and not self._rank_local_registration_active:
+            logger.warning(
+                "Rank-local host registration requires page-aligned worker "
+                "slices; falling back to full mmap registration for rank=%d",
+                rank,
+            )
+        self.registration_mode = (
+            "rank-local"
+            if self._rank_local_registration_active
+            else "full-fallback"
+            if rank_local_registration
+            else "full"
+        )
+        self._worker_slot_size = cpu_page_size if rank is not None else None
         self._population_thread: threading.Thread | None = None
         self._population_error: Exception | None = None
         self.population_time_s = 0.0
@@ -67,6 +86,11 @@ class SharedOffloadRegion:
         self.register_time_s = 0.0
         self.ready_barrier_wait_time_s = 0.0
         self.initialization_time_s = 0.0
+        self._registered_ranges: list[tuple[int, int]] = []
+        self.registration_call_count = 0
+        self.registered_bytes = 0
+        self.unregister_call_count = 0
+        self.unregister_time_s = 0.0
         if rank is not None:
             # byte offset to this worker's first slot within each block row
             self._worker_offset = rank * cpu_page_size
@@ -126,6 +150,69 @@ class SharedOffloadRegion:
         self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
         self._views: list[torch.Tensor] = []
         self.is_pinned: bool = False
+
+    def get_host_registration_ranges(self) -> list[tuple[int, int]]:
+        """Return page-aligned mmap ranges for CUDA host registration.
+
+        Rank-local registration covers this worker's slice in each block row.
+        The ranges are expanded to page boundaries because CUDA host
+        registration requires page-aligned addresses and sizes, then adjacent
+        ranges are merged.  Full-region registration returns one range.
+        """
+        if self.total_size_bytes == 0:
+            return []
+        if not self._rank_local_registration_active:
+            return [(0, self.total_size_bytes)]
+
+        assert self._worker_slot_size is not None
+        ranges: list[tuple[int, int]] = []
+        for block in range(self.num_blocks):
+            raw_start = block * self._row_stride + self.rank * self._worker_slot_size
+            raw_end = raw_start + self._worker_slot_size
+            start = (raw_start // self.page_size) * self.page_size
+            end = (
+                (raw_end + self.page_size - 1) // self.page_size
+            ) * self.page_size
+            assert end <= (block + 1) * self._row_stride
+            if ranges and start <= ranges[-1][0] + ranges[-1][1]:
+                previous_start, previous_length = ranges[-1]
+                previous_end = previous_start + previous_length
+                ranges[-1] = (previous_start, max(previous_end, end) - previous_start)
+            else:
+                ranges.append((start, end - start))
+        return ranges
+
+    def unregister_host_registration(self) -> None:
+        """Unregister all host ranges while keeping the mmap alive."""
+        ranges = list(self._registered_ranges)
+        if not ranges and self.is_pinned and self._base is not None:
+            ranges = [(self._base.data_ptr(), self.total_size_bytes)]
+
+        if ranges and current_platform.is_cuda_alike():
+            _t0 = time.perf_counter()
+            cudart = torch.cuda.cudart()
+            for ptr, _ in reversed(ranges):
+                try:
+                    result = cudart.cudaHostUnregister(ptr)
+                    self.unregister_call_count += 1
+                except Exception:
+                    logger.warning(
+                        "cudaHostUnregister raised for rank=%d",
+                        self.rank,
+                        exc_info=True,
+                    )
+                    continue
+                if result.value != 0:
+                    logger.warning(
+                        "cudaHostUnregister failed for rank=%d (code=%d)",
+                        self.rank,
+                        result,
+                    )
+            self.unregister_time_s += time.perf_counter() - _t0
+
+        self._registered_ranges.clear()
+        self.registered_bytes = 0
+        self.is_pinned = False
 
     def _populate_worker_pages(
         self, advice: int, worker_offset: int, cpu_page_size: int
@@ -247,17 +334,8 @@ class SharedOffloadRegion:
                 exc_info=(type(error), error, error.__traceback__),
             )
 
-        if self.is_pinned and self._base is not None:
-            if current_platform.is_cuda_alike():
-                base_ptr = self._base.data_ptr()
-                result = torch.cuda.cudart().cudaHostUnregister(base_ptr)
-                if result.value != 0:
-                    logger.warning(
-                        "cudaHostUnregister failed for rank=%d (code=%d)",
-                        self.rank,
-                        result,
-                    )
-            self.is_pinned = False
+        if self._registered_ranges or self.is_pinned:
+            self.unregister_host_registration()
         # Release views before _base: each view holds a _base reference and a
         # direct StorageImpl reference.  Freeing views first lets both refcounts
         # drop so the storage (which holds the mmap_obj buffer export) is freed

@@ -181,7 +181,7 @@ def _tp_max_time(tp_group, elapsed: float) -> float:
 
 
 def pin_mmap_region(region: SharedOffloadRegion) -> None:
-    """Register the entire mmap as CUDA pinned memory via cudaHostRegister."""
+    """Register the selected mmap ranges as CUDA pinned memory."""
     if not current_platform.is_cuda_alike():
         region.register_time_s = 0.0
         logger.info(
@@ -192,34 +192,44 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
         return
 
     rank = region.rank
+    ranges = region.get_host_registration_ranges()
+    region.registration_call_count = 0
+    region.registered_bytes = 0
+    registered_ranges: list[tuple[int, int]] = []
 
     _t0 = time.perf_counter()
     base_ptr = region._base.data_ptr()
     try:
-        result = torch.cuda.cudart().cudaHostRegister(
-            base_ptr, region.total_size_bytes, 0
-        )
+        cudart = torch.cuda.cudart()
+        for offset, length in ranges:
+            region.registration_call_count += 1
+            result = cudart.cudaHostRegister(base_ptr + offset, length, 0)
+            if result.value != 0:
+                raise RuntimeError(
+                    "cudaHostRegister failed for rank="
+                    f"{rank} with error code {result.value}"
+                )
+            registered_ranges.append((base_ptr + offset, length))
+    except Exception:
+        # Roll back ranges registered before a later range failed. This keeps
+        # the worker safe even before the TP error collective runs.
+        region._registered_ranges = registered_ranges
+        region.unregister_host_registration()
+        raise
     finally:
         region.register_time_s = time.perf_counter() - _t0
-    if result.value != 0:
-        logger.warning(
-            "cudaHostRegister failed for rank=%d (code=%d) — "
-            "the offload worker will not start; elapsed %.3f s",
-            rank,
-            result,
-            region.register_time_s,
-        )
-        raise RuntimeError(
-            f"cudaHostRegister failed for rank={rank} with error code {result.value}"
-        )
-    else:
-        logger.debug(
-            "cudaHostRegister rank=%d %.2f GB in %.3f s",
-            rank,
-            region.total_size_bytes / 1e9,
-            region.register_time_s,
-        )
-        region.is_pinned = True
+
+    region._registered_ranges = registered_ranges
+    region.registered_bytes = sum(length for _, length in registered_ranges)
+    region.is_pinned = bool(registered_ranges)
+    logger.debug(
+        "cudaHostRegister rank=%d mode=%s calls=%d %.2f GB in %.3f s",
+        rank,
+        getattr(region, "registration_mode", "full"),
+        region.registration_call_count,
+        region.registered_bytes / 1e9,
+        region.register_time_s,
+    )
 
 
 def _new_descriptor_buffers(
@@ -661,12 +671,15 @@ class CPUOffloadingWorker(OffloadingWorker):
             logger.info(
                 "CPU offload mmap initialized rank=%d: population=%.3f s, "
                 "population_barrier=%.3f s, register=%.3f s, "
+                "register_calls=%d, registered_bytes=%d, "
                 "ready_barrier=%.3f s, total=%.3f s, "
                 "tp_max=%.3f s",
                 mmap_region.rank,
                 mmap_region.population_time_s,
                 mmap_region.population_barrier_wait_time_s,
                 mmap_region.register_time_s,
+                mmap_region.registration_call_count,
+                mmap_region.registered_bytes,
                 mmap_region.ready_barrier_wait_time_s,
                 mmap_region.initialization_time_s,
                 max_initialization_time,

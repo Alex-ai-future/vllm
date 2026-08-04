@@ -10,6 +10,7 @@ LABEL="${LABEL:-candidate}"
 MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
 TP="${TP:-1}"
 CONTROL_GIB="${CONTROL_GIB:-4}"
+RANK_LOCAL_REGISTRATION="${RANK_LOCAL_REGISTRATION:-0}"
 OUTPUT_DIR="${OUTPUT_DIR:-benchmarks/results/async_madvise/${LABEL}}"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
@@ -40,6 +41,7 @@ mkdir -p "${OUTPUT_DIR}"
     echo "tensor_parallel_size=${TP}"
     echo "control_gib=${CONTROL_GIB}"
     echo "stress_gib=${stress_gib}"
+    echo "rank_local_registration=${RANK_LOCAL_REGISTRATION}"
     echo "kernel=$(uname -a)"
     echo "shm=$(df -h /dev/shm | tail -n 1)"
     if command -v nvidia-smi >/dev/null 2>&1; then
@@ -54,10 +56,18 @@ run_case() {
     local output_log="${OUTPUT_DIR}/${name}.log"
 
     echo "Running ${LABEL}/${name}: ${offload_gib} GiB"
+    local extra_args=()
+    if [[ "${RANK_LOCAL_REGISTRATION}" == "1" ]]; then
+        extra_args+=(
+            --kv-transfer-config
+            '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"rank_local_registration":true}}'
+        )
+    fi
     VLLM_LOGGING_LEVEL=DEBUG vllm bench startup \
         --model "${MODEL}" \
         --tensor-parallel-size "${TP}" \
         --kv-offloading-size "${offload_gib}" \
+        "${extra_args[@]}" \
         --num-iters-cold 1 \
         --num-iters-warmup 1 \
         --num-iters-warm 5 \
