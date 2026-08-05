@@ -92,6 +92,11 @@ class CPUOffloadingSpec(OffloadingSpec):
         self.rank_local_registration = bool(
             self.extra_config.get("rank_local_registration", False)
         )
+        self.overlap_population_with_gpu_init = bool(
+            self.extra_config.get("overlap_population_with_gpu_init", False)
+        )
+        self._mmap_region: SharedOffloadRegion | None = None
+        self._last_mmap_timing: dict[str, float] | None = None
         if config.worker_kv_bytes_per_block > 0 and world_size > 0:
             num_copies = 1 if self.replicated_layout else world_size
             kv_bytes_per_block = config.worker_kv_bytes_per_block * num_copies
@@ -150,26 +155,72 @@ class CPUOffloadingSpec(OffloadingSpec):
         per-rank tensor); replicated-layout dedup is gated on this being True."""
         return current_platform.is_cuda_alike()
 
+    def _worker_rank(self) -> int:
+        if self.replicated_layout:
+            return 0
+        world_size = self.config.parallel.world_size
+        return torch.accelerator.current_device_index() % world_size
+
+    def prepare_mmap_region(self) -> None:
+        """Start host mmap population before GPU KV cache allocation."""
+        if (
+            not self.overlap_population_with_gpu_init
+            or not self._uses_shared_region()
+            or self.num_blocks <= 0
+            or self._mmap_region is not None
+        ):
+            return
+
+        self._mmap_region = SharedOffloadRegion(
+            engine_id=self.config.engine_id,
+            num_blocks=self.num_blocks,
+            rank=self._worker_rank(),
+            kv_bytes_per_block=self.kv_bytes_per_chunk,
+            cpu_page_size=self.cpu_page_size_per_worker,
+            async_population=True,
+            rank_local_registration=self.rank_local_registration,
+        )
+
+    def abort_mmap_region(self) -> None:
+        if self._mmap_region is not None:
+            self._mmap_region.cleanup()
+            self._mmap_region = None
+
+    def get_mmap_timing(self) -> dict[str, float] | None:
+        region = self._mmap_region
+        if region is None:
+            return self._last_mmap_timing
+        return {
+            "population_start_time": region.population_start_time,
+            "population_end_time": region.population_end_time,
+            "population_time_s": region.population_time_s,
+            "population_wait_time_s": region.population_wait_time_s,
+            "register_time_s": region.register_time_s,
+        }
+
     def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
-        mmap_region: SharedOffloadRegion | None = None
+        mmap_region = self._mmap_region
         # num_blocks == 0 would size the region to zero bytes, which cannot be
         # mmap'd; fall back to the tensor path (empty tensors) as before.
         if self._uses_shared_region() and self.num_blocks > 0:
-            # Replicated layout puts all ranks on slot 0 (single MLA copy);
-            # otherwise each rank takes its own slot by physical device index.
-            if self.replicated_layout:
-                rank = 0
-            else:
-                world_size = self.config.parallel.world_size
-                rank = torch.accelerator.current_device_index() % world_size
-            mmap_region = SharedOffloadRegion(
-                engine_id=self.config.engine_id,
-                num_blocks=self.num_blocks,
-                rank=rank,
-                kv_bytes_per_block=self.kv_bytes_per_chunk,
-                cpu_page_size=self.cpu_page_size_per_worker,
-                rank_local_registration=self.rank_local_registration,
+            if mmap_region is None:
+                mmap_region = SharedOffloadRegion(
+                    engine_id=self.config.engine_id,
+                    num_blocks=self.num_blocks,
+                    rank=self._worker_rank(),
+                    kv_bytes_per_block=self.kv_bytes_per_chunk,
+                    cpu_page_size=self.cpu_page_size_per_worker,
+                    rank_local_registration=self.rank_local_registration,
+                )
+            worker = CPUOffloadingWorker(
+                kv_caches=kv_caches,
+                blocks_per_chunk=self.blocks_per_chunk,
+                num_cpu_blocks=self.num_blocks,
+                mmap_region=mmap_region,
             )
+            self._last_mmap_timing = self.get_mmap_timing()
+            self._mmap_region = None
+            return worker
         return CPUOffloadingWorker(
             kv_caches=kv_caches,
             blocks_per_chunk=self.blocks_per_chunk,

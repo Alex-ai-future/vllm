@@ -66,6 +66,20 @@ class OffloadingConnectorWorker:
     def _init_worker(self, kv_caches: CanonicalKVCaches) -> None:
         self.worker = self.spec.get_worker(kv_caches)
 
+    def prepare_kv_cache_offload(self) -> None:
+        prepare = getattr(self.spec, "prepare_mmap_region", None)
+        if prepare is not None:
+            prepare()
+
+    def abort_kv_cache_offload(self) -> None:
+        abort = getattr(self.spec, "abort_mmap_region", None)
+        if abort is not None:
+            abort()
+
+    def get_kv_cache_offload_timing(self) -> dict[str, float] | None:
+        get_timing = getattr(self.spec, "get_mmap_timing", None)
+        return get_timing() if get_timing is not None else None
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         kv_cache_config = self.kv_cache_config
         num_blocks = kv_cache_config.num_blocks
@@ -394,3 +408,5 @@ class OffloadingConnectorWorker:
         self._connector_worker_meta = OffloadingWorkerMetadata()
         if self.worker is not None:
             self.worker.shutdown()
+        else:
+            self.abort_kv_cache_offload()

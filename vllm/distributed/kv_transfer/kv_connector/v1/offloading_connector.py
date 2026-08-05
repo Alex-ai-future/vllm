@@ -89,6 +89,19 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
 
+    def prepare_kv_cache_offload(self) -> None:
+        if self.connector_worker is not None:
+            self.connector_worker.prepare_kv_cache_offload()
+
+    def abort_kv_cache_offload(self) -> None:
+        if self.connector_worker is not None:
+            self.connector_worker.abort_kv_cache_offload()
+
+    def get_kv_cache_offload_timing(self) -> dict[str, float] | None:
+        if self.connector_worker is None:
+            return None
+        return self.connector_worker.get_kv_cache_offload_timing()
+
     def register_cross_layers_kv_cache(
         self, kv_cache: torch.Tensor, attn_backend: type[AttentionBackend]
     ):

@@ -270,6 +270,17 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def prepare_kv_cache_offload(self) -> None:
+        """Prepare host-side KV offload before GPU cache allocation."""
+        return
+
+    def abort_kv_cache_offload(self) -> None:
+        """Abort host-side KV offload preparation after initialization fails."""
+        return
+
+    def get_kv_cache_offload_timing(self) -> dict[str, float] | None:
+        return None
+
     def register_cross_layers_kv_cache(
         self, kv_cache: torch.Tensor, attn_backend: type["AttentionBackend"]
     ):

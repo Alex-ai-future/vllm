@@ -20,6 +20,7 @@ WARM_ITERS="${WARM_ITERS:-3}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-2048}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
 RANK_LOCAL_REGISTRATION="${RANK_LOCAL_REGISTRATION:-0}"
+OVERLAP_POPULATION="${OVERLAP_POPULATION:-0}"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
     echo "This benchmark requires Linux." >&2
@@ -73,6 +74,7 @@ fi
     echo "max_model_len=${MAX_MODEL_LEN}"
     echo "enforce_eager=${ENFORCE_EAGER}"
     echo "rank_local_registration=${RANK_LOCAL_REGISTRATION}"
+    echo "overlap_population=${OVERLAP_POPULATION}"
     echo "kernel=$(uname -a)"
     echo "shm=$(df -h /dev/shm | tail -n 1)"
     echo "cuda_home=${CUDA_HOME}"
@@ -95,11 +97,21 @@ run_case() {
     if [[ "${ENFORCE_EAGER}" == "1" ]]; then
         extra_args+=(--enforce-eager)
     fi
-    if [[ "${label}" == "candidate" && "${RANK_LOCAL_REGISTRATION}" == "1" ]]; then
-        extra_args+=(
-            --kv-transfer-config
-            '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"rank_local_registration":true}}'
-        )
+    if [[ "${label}" == "candidate" ]]; then
+        local extra_config=""
+        if [[ "${RANK_LOCAL_REGISTRATION}" == "1" && "${OVERLAP_POPULATION}" == "1" ]]; then
+            extra_config='"rank_local_registration":true,"overlap_population_with_gpu_init":true'
+        elif [[ "${RANK_LOCAL_REGISTRATION}" == "1" ]]; then
+            extra_config='"rank_local_registration":true'
+        elif [[ "${OVERLAP_POPULATION}" == "1" ]]; then
+            extra_config='"overlap_population_with_gpu_init":true'
+        fi
+        if [[ -n "${extra_config}" ]]; then
+            extra_args+=(
+                --kv-transfer-config
+                "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{${extra_config}}}"
+            )
+        fi
     fi
 
     echo "Running ${label} run=${run_id}"

@@ -198,6 +198,7 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     registered_ranges: list[tuple[int, int]] = []
 
     _t0 = time.perf_counter()
+    torch.cuda.nvtx.range_push("cuda_host_register")
     base_ptr = region._base.data_ptr()
     try:
         cudart = torch.cuda.cudart()
@@ -218,6 +219,7 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
         raise
     finally:
         region.register_time_s = time.perf_counter() - _t0
+        torch.cuda.nvtx.range_pop()
 
     region._registered_ranges = registered_ranges
     region.registered_bytes = sum(length for _, length in registered_ranges)

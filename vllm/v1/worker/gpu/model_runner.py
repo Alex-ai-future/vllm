@@ -31,6 +31,10 @@ import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.kv_transfer import (
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
@@ -48,6 +52,7 @@ from vllm.multimodal.encoder_budget import (
     MultiModalBudget,
     get_dummy_encoder_profile_inputs,
 )
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.math_utils import cdiv
@@ -528,6 +533,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.speculator.init_cudagraph_manager(cudagraph_mode)
 
         self.kv_caches: list[torch.Tensor] = []
+        gpu_kv_init_start = time.perf_counter()
+        if has_kv_transfer_group():
+            get_kv_transfer_group().prepare_kv_cache_offload()
+            if current_platform.is_cuda_alike():
+                torch.cuda.nvtx.range_push("gpu_kv_cache_allocation")
         kv_caches_dict = init_kv_cache(
             self.kv_caches,
             self.compilation_config.static_forward_context,
@@ -538,7 +548,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kernel_block_sizes,
             self.vllm_config,
         )
+        if has_kv_transfer_group() and current_platform.is_cuda_alike():
+            torch.cuda.nvtx.range_pop()
+        gpu_kv_init_end = time.perf_counter()
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+        if has_kv_transfer_group():
+            timing = get_kv_transfer_group().get_kv_cache_offload_timing()
+            if timing is not None:
+                overlap_start = max(
+                    timing["population_start_time"], gpu_kv_init_start
+                )
+                overlap_end = min(timing["population_end_time"], gpu_kv_init_end)
+                logger.info(
+                    "KV offload GPU-init timing: gpu_init=%.3f s, "
+                    "population=%.3f s, population_wait=%.3f s, "
+                    "population_overlap=%.3f s",
+                    gpu_kv_init_end - gpu_kv_init_start,
+                    timing["population_time_s"],
+                    timing["population_wait_time_s"],
+                    max(0.0, overlap_end - overlap_start),
+                )
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""

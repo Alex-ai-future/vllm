@@ -80,6 +80,8 @@ class SharedOffloadRegion:
         self._worker_slot_size = cpu_page_size if rank is not None else None
         self._population_thread: threading.Thread | None = None
         self._population_error: Exception | None = None
+        self.population_start_time = 0.0
+        self.population_end_time = 0.0
         self.population_time_s = 0.0
         self.population_wait_time_s = 0.0
         self.population_barrier_wait_time_s = 0.0
@@ -123,6 +125,7 @@ class SharedOffloadRegion:
         # MADV_POPULATE_WRITE was added in Linux 5.14 (value 23).
         _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
         if rank is not None:
+            self.population_start_time = time.perf_counter()
             if async_population:
                 self._population_thread = threading.Thread(
                     target=self._run_population_in_background,
@@ -141,8 +144,10 @@ class SharedOffloadRegion:
         else:
             # No rank — populate the entire shared region in one call.
             _t0 = time.perf_counter()
+            self.population_start_time = _t0
             self.mmap_obj.madvise(_MADV_POPULATE_WRITE, 0, self.total_size_bytes)
             self.population_time_s = time.perf_counter() - _t0
+            self.population_end_time = time.perf_counter()
             logger.debug(
                 "MADV_POPULATE_WRITE entire region: %.3f s", self.population_time_s
             )
@@ -230,6 +235,7 @@ class SharedOffloadRegion:
                 self.mmap_obj.madvise(advice, aligned_offset, aligned_length)
         finally:
             self.population_time_s = time.perf_counter() - _t0
+            self.population_end_time = time.perf_counter()
 
         logger.debug(
             "MADV_POPULATE_WRITE loop: %d blocks in %.3f s",

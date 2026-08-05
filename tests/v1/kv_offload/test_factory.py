@@ -440,6 +440,40 @@ def test_cpu_spec_create_worker_passes_rank_local_registration(monkeypatch):
     assert region_calls[0]["rank_local_registration"] is True
 
 
+def test_cpu_spec_can_prepare_mmap_before_worker_creation(monkeypatch):
+    import vllm.v1.kv_offload.cpu.spec as cpu_spec_module
+
+    worker_kv_bytes_per_block = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+    spec = _create_spec(
+        worker_kv_bytes_per_block=worker_kv_bytes_per_block,
+        world_size=4,
+        extra_config={"overlap_population_with_gpu_init": True},
+    )
+    assert isinstance(spec, CPUOffloadingSpec)
+
+    region = MagicMock()
+    region_calls: list[dict[str, Any]] = []
+
+    def fake_region_ctor(**kwargs):
+        region_calls.append(kwargs)
+        return region
+
+    monkeypatch.setattr(cpu_spec_module.current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(cpu_spec_module, "SharedOffloadRegion", fake_region_ctor)
+    monkeypatch.setattr(cpu_spec_module, "CPUOffloadingWorker", MagicMock())
+    monkeypatch.setattr(
+        cpu_spec_module.torch.accelerator, "current_device_index", lambda: 5
+    )
+
+    spec.prepare_mmap_region()
+    spec.prepare_mmap_region()
+    assert len(region_calls) == 1
+    assert region_calls[0]["async_population"] is True
+
+    spec.create_worker(MagicMock())
+    assert len(region_calls) == 1
+
+
 def test_cpu_spec_create_worker_uses_tensor_path_off_cuda_alike(monkeypatch):
     import vllm.v1.kv_offload.cpu.spec as cpu_spec_module
 
