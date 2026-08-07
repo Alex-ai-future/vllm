@@ -5,14 +5,22 @@
 import contextlib
 import mmap
 import os
+import sys
 import threading
 import time
 import uuid
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 from vllm.utils.system_utils import get_mp_context
+from vllm.v1.kv_offload.cpu.host_memory import (
+    create_rank_local_alias,
+    create_rank_local_alias_view,
+    destroy_rank_local_alias,
+    rank_local_alias_supported,
+)
 from vllm.v1.kv_offload.cpu.shared_offload_region import (
     SharedOffloadRegion,
     _wait_for_file_size,
@@ -295,6 +303,59 @@ def test_create_next_view_multi_tensor_layout(iid):
                 b == 2 for b in raw[row_offset + PAGE_SIZE : row_offset + 2 * PAGE_SIZE]
             )
         del raw, ta, tb
+
+
+def test_rank_local_alias_maps_and_writes_rank_slot(iid):
+    """The alias must expose one rank's interleaved slots without copying."""
+    num_blocks = 3
+    num_workers = 2
+    rank = 1
+    row_stride = num_workers * PAGE_SIZE
+    alias_base = None
+    _alias_buffer = None
+    alias_tensor = None
+    alias_view = None
+
+    with _region(
+        iid,
+        num_blocks=num_blocks,
+        num_workers=num_workers,
+        cpu_page_size=PAGE_SIZE,
+        rank=rank,
+    ) as r:
+        assert r.fd is not None
+        assert rank_local_alias_supported(r.fd, num_blocks, row_stride, PAGE_SIZE, rank)
+        raw = r._base.view(num_blocks, row_stride)
+        for block in range(num_blocks):
+            raw[block, rank * PAGE_SIZE : (rank + 1) * PAGE_SIZE].fill_(block + 1)
+            raw[block, :PAGE_SIZE].fill_(99)
+
+        try:
+            alias_base, _alias_buffer, alias_tensor = create_rank_local_alias(
+                r.fd, num_blocks, row_stride, PAGE_SIZE, rank
+            )
+            alias_view, next_offset = create_rank_local_alias_view(
+                alias_tensor,
+                num_blocks,
+                PAGE_SIZE,
+                PAGE_SIZE,
+                storage_offset=0,
+            )
+
+            expected = raw[:, rank * PAGE_SIZE : (rank + 1) * PAGE_SIZE]
+            assert alias_view.shape == (num_blocks, PAGE_SIZE)
+            assert alias_view.stride() == (PAGE_SIZE, 1)
+            assert next_offset == PAGE_SIZE
+            assert torch.equal(alias_view, expected)
+
+            alias_view[1, :] = 77
+            assert torch.all(expected[1, :] == 77)
+        finally:
+            alias_view = None
+            alias_tensor = None
+            _alias_buffer = None
+            destroy_rank_local_alias(alias_base, num_blocks * PAGE_SIZE)
+            del raw
 
 
 def test_create_next_view_multiprocess_slots(iid):

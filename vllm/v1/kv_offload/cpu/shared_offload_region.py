@@ -3,6 +3,7 @@
 import mmap
 import os
 import time
+from typing import Any
 
 import torch
 
@@ -11,8 +12,19 @@ from vllm.distributed.device_communicators.shm_broadcast import (
 )
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.v1.kv_offload.cpu.host_memory import (
+    create_rank_local_alias,
+    create_rank_local_alias_view,
+    destroy_rank_local_alias,
+    rank_local_alias_supported,
+)
 
 logger = init_logger(__name__)
+
+
+def _cuda_result_code(result: Any) -> int:
+    value = getattr(result, "value", result)
+    return int(value)
 
 
 def _wait_for_file_size(fd: int, expected_size: int, timeout: float = 30.0) -> None:
@@ -54,6 +66,7 @@ class SharedOffloadRegion:
 
         self.num_blocks = num_blocks
         self._row_stride = kv_bytes_per_block
+        self._cpu_page_size = cpu_page_size
         self.total_size_bytes = self.num_blocks * self._row_stride
 
         self.mmap_path = f"/dev/shm/vllm_offload_{engine_id}.mmap"
@@ -135,6 +148,113 @@ class SharedOffloadRegion:
         self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
         self._views: list[torch.Tensor] = []
         self.is_pinned: bool = False
+        self._pinned_ptr: int | None = None
+        self._alias_base: int | None = None
+        self._alias_size = 0
+        self._alias_buffer: Any | None = None
+        self._alias_tensor: torch.Tensor | None = None
+        self._alias_views: list[torch.Tensor] = []
+        self._alias_offset = 0
+
+    def create_next_transfer_view(self, tensor_page_size: int) -> torch.Tensor:
+        """Create the next transfer view, using the alias when available."""
+        if self._alias_tensor is not None:
+            alias_view, new_offset = create_rank_local_alias_view(
+                self._alias_tensor,
+                self.num_blocks,
+                self._cpu_page_size,
+                tensor_page_size,
+                self._alias_offset,
+            )
+            self._alias_offset = new_offset
+            self._alias_views.append(alias_view)
+            return alias_view
+        return self.create_next_view(tensor_page_size)
+
+    def _register_rank_local_alias(self, cudart: Any) -> None:
+        assert self.fd is not None
+        assert self.rank is not None
+        alias_size = self.num_blocks * self._cpu_page_size
+        alias_base, alias_buffer, alias_tensor = create_rank_local_alias(
+            self.fd,
+            self.num_blocks,
+            self._row_stride,
+            self._cpu_page_size,
+            self.rank,
+        )
+        try:
+            result = cudart.cudaHostRegister(alias_base, alias_size, 0)
+            code = _cuda_result_code(result)
+            if code != 0:
+                raise RuntimeError(
+                    f"cudaHostRegister rank-local alias failed for "
+                    f"rank={self.rank} (code={code})"
+                )
+        except BaseException:
+            alias_tensor = None
+            alias_buffer = None
+            destroy_rank_local_alias(alias_base, alias_size)
+            raise
+
+        self._alias_base = alias_base
+        self._alias_size = alias_size
+        self._alias_buffer = alias_buffer
+        self._alias_tensor = alias_tensor
+        self._pinned_ptr = alias_base
+        self.is_pinned = True
+        logger.debug(
+            "cudaHostRegister rank=%d rank-local alias %.2f GB (source %.2f GB)",
+            self.rank,
+            alias_size / 1e9,
+            self.total_size_bytes / 1e9,
+        )
+
+    def _register_full_mmap(self, cudart: Any) -> None:
+        base_ptr = self._base.data_ptr()
+        result = cudart.cudaHostRegister(base_ptr, self.total_size_bytes, 0)
+        code = _cuda_result_code(result)
+        if code != 0:
+            logger.warning(
+                "cudaHostRegister failed for rank=%d (code=%d) — "
+                "transfers will still work but may be slower (unpinned DMA)",
+                self.rank,
+                code,
+            )
+            return
+
+        self._pinned_ptr = base_ptr
+        self.is_pinned = True
+        logger.debug(
+            "cudaHostRegister rank=%d full mmap %.2f GB",
+            self.rank,
+            self.total_size_bytes / 1e9,
+        )
+
+    def pin_cuda_host_memory(self) -> None:
+        """Register the region with CUDA using its layout-specific path."""
+        if self.is_pinned:
+            return
+        if not current_platform.is_cuda_alike():
+            logger.info(
+                "Skipping mmap host registration on %s; cudaHostRegister is "
+                "only available on CUDA/ROCm.",
+                current_platform.device_name,
+            )
+            return
+
+        cudart = torch.cuda.cudart()
+        if current_platform.is_cuda() and self.rank is not None:
+            assert self.fd is not None
+            if rank_local_alias_supported(
+                self.fd,
+                self.num_blocks,
+                self._row_stride,
+                self._cpu_page_size,
+                self.rank,
+            ):
+                self._register_rank_local_alias(cudart)
+                return
+        self._register_full_mmap(cudart)
 
     def create_next_view(self, tensor_page_size: int) -> torch.Tensor:
         """Allocate a strided int8 view for this worker, one canonical tensor.
@@ -190,17 +310,26 @@ class SharedOffloadRegion:
         return memoryview(np_arr)
 
     def cleanup(self) -> None:
-        if self.is_pinned and self._base is not None:
+        if self.is_pinned and self._pinned_ptr is not None:
             if current_platform.is_cuda_alike():
-                base_ptr = self._base.data_ptr()
-                result = torch.cuda.cudart().cudaHostUnregister(base_ptr)
-                if result.value != 0:
+                result = torch.cuda.cudart().cudaHostUnregister(self._pinned_ptr)
+                code = _cuda_result_code(result)
+                if code != 0:
                     logger.warning(
                         "cudaHostUnregister failed for rank=%d (code=%d)",
                         self.rank,
-                        result,
+                        code,
                     )
             self.is_pinned = False
+            self._pinned_ptr = None
+        if self._alias_base is not None:
+            self._alias_views.clear()
+            self._alias_tensor = None
+            self._alias_buffer = None
+            destroy_rank_local_alias(self._alias_base, self._alias_size)
+            self._alias_base = None
+            self._alias_size = 0
+            self._alias_offset = 0
         # Release views before _base: each view holds a _base reference and a
         # direct StorageImpl reference.  Freeing views first lets both refcounts
         # drop so the storage (which holds the mmap_obj buffer export) is freed
