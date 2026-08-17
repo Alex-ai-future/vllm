@@ -1075,7 +1075,8 @@ class OffloadingConnectorScheduler:
             if req_status.offloading_context.policy == OffloadPolicy.BLOCK_LEVEL:
                 group_state.next_stored_chunk_idx = num_chunks
 
-        src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
+        self.manager.prepare_load(keys_to_load, req_status.req_context)
+        src_spec = self.manager.get_spec(keys_to_load)
         dst_spec = GPULoadStoreSpec(
             dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
         )
@@ -1240,7 +1241,7 @@ class OffloadingConnectorScheduler:
                     group_sizes=group_sizes,
                     block_indices=block_indices,
                 ),
-                dst_spec=store_output.store_spec,
+                dst_spec=self.manager.get_spec(store_output.keys_to_store),
             )
 
         return store_jobs
@@ -1394,7 +1395,7 @@ class OffloadingConnectorScheduler:
             src_spec = GPULoadStoreSpec(
                 src_block_ids, group_sizes=group_sizes, block_indices=block_indices
             )
-            dst_spec = store_output.store_spec
+            dst_spec = self.manager.get_spec(store_output.keys_to_store)
 
             job_id = self._generate_job_id()
             # a store can only be issued when no load is pending.

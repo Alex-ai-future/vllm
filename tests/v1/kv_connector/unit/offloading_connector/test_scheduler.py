@@ -107,8 +107,8 @@ def test_partial_tail_store_uses_attention_and_recurrent_cow_sources():
     req_status = scheduler._req_status["req"]
     req_status.group_states[0].block_ids[:] = [11, 12]
     req_status.group_states[1].block_ids[:] = [0, 21]
-    scheduler.manager.prepare_store.side_effect = (
-        lambda keys, req_context: generate_store_output(keys)
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
     )
 
     output = SimpleNamespace(partial_tail_offloads={"req": [(1, 99, 28)]})
@@ -125,6 +125,9 @@ def test_partial_tail_store_uses_attention_and_recurrent_cow_sources():
         12: {job_id},
         99: {job_id},
     }
+    scheduler.manager.prepare_store.assert_called_once()
+    accepted_keys = scheduler.manager.prepare_store.call_args.args[0]
+    scheduler.manager.get_spec.assert_called_once_with(accepted_keys)
     assert scheduler.config.supports_partial_tail
 
     events = list(
@@ -183,6 +186,9 @@ def test_partial_lookup_returns_exact_boundary_and_group_load_keys():
     assert dst_spec.block_ids.tolist() == [31, 32, 41]
     assert dst_spec.group_sizes == [2, 1]
     assert dst_spec.block_indices == [0, 1]
+    scheduler.manager.prepare_load.assert_called_once()
+    load_keys = scheduler.manager.prepare_load.call_args.args[0]
+    scheduler.manager.get_spec.assert_called_once_with(load_keys)
     assert req_status.partial_tail_boundary is None
 
 

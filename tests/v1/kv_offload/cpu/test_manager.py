@@ -8,7 +8,6 @@ import numpy as np
 import pytest
 
 from vllm.v1.kv_offload.base import (
-    LoadStoreSpec,
     LookupResult,
     Medium,
     OffloadingEvent,
@@ -80,6 +79,7 @@ def to_keys(int_hashes: list[int]) -> list[OffloadKey]:
 
 
 def verify_store_output(
+    manager: CPUOffloadingManager,
     prepare_store_output: PrepareStoreOutput | None,
     expected_prepare_store_output: ExpectedPrepareStoreOutput,
 ):
@@ -90,7 +90,7 @@ def verify_store_output(
     assert prepare_store_output.evicted_keys == to_keys(
         expected_prepare_store_output.evicted_keys
     )
-    store_spec = prepare_store_output.store_spec
+    store_spec = manager.get_spec(prepare_store_output.keys_to_store)
     assert isinstance(store_spec, CPULoadStoreSpec)
     expected_array = np.array(
         expected_prepare_store_output.store_block_ids, dtype=np.int64
@@ -99,11 +99,14 @@ def verify_store_output(
 
 
 def verify_load_output(
-    prepare_load_output: LoadStoreSpec, expected_prepare_load_output: list[int]
+    manager: CPUOffloadingManager,
+    keys: list[OffloadKey],
+    expected_block_ids: list[int],
 ):
-    assert isinstance(prepare_load_output, CPULoadStoreSpec)
-    expected_array = np.array(expected_prepare_load_output, dtype=np.int64)
-    assert np.array_equal(expected_array, prepare_load_output.block_ids)
+    load_spec = manager.get_spec(keys)
+    assert isinstance(load_spec, CPULoadStoreSpec)
+    expected_array = np.array(expected_block_ids, dtype=np.int64)
+    assert np.array_equal(expected_array, load_spec.block_ids)
 
 
 def check_split_usage_stats(
@@ -198,6 +201,7 @@ def test_already_stored_block_not_evicted_during_prepare_store(eviction_policy):
     #   - block 1 (ID 0) is evicted instead; new blocks [3,4,5] get IDs 2,3,0
     prepare_store_output = manager.prepare_store(to_keys([2, 3, 4, 5]), _EMPTY_REQ_CTX)
     verify_store_output(
+        manager,
         prepare_store_output,
         ExpectedPrepareStoreOutput(
             keys_to_store=[3, 4, 5],
@@ -223,6 +227,7 @@ def test_filter_reused_manager_reports_stores_skipped_counter():
     prepare_store_output = manager.prepare_store(to_keys([1, 2, 3]), _EMPTY_REQ_CTX)
 
     verify_store_output(
+        manager,
         prepare_store_output,
         ExpectedPrepareStoreOutput(
             keys_to_store=[],
@@ -375,6 +380,7 @@ def test_cpu_manager():
     # prepare store [1, 2]
     prepare_store_output = cpu_manager.prepare_store(to_keys([1, 2]), _EMPTY_REQ_CTX)
     verify_store_output(
+        cpu_manager,
         prepare_store_output,
         ExpectedPrepareStoreOutput(
             keys_to_store=[1, 2],
@@ -404,6 +410,7 @@ def test_cpu_manager():
         to_keys([2, 3, 4, 5]), _EMPTY_REQ_CTX
     )
     verify_store_output(
+        cpu_manager,
         prepare_store_output,
         ExpectedPrepareStoreOutput(
             keys_to_store=[3, 4, 5],
@@ -430,8 +437,9 @@ def test_cpu_manager():
     assert cpu_manager.lookup(to_key(0), _EMPTY_REQ_CTX) is LookupResult.MISS
 
     # prepare load [2, 3]
-    prepare_load_output = cpu_manager.prepare_load(to_keys([2, 3]), _EMPTY_REQ_CTX)
-    verify_load_output(prepare_load_output, [1, 2])
+    load_keys = to_keys([2, 3])
+    cpu_manager.prepare_load(load_keys, _EMPTY_REQ_CTX)
+    verify_load_output(cpu_manager, load_keys, [1, 2])
 
     # prepare store with no space ([2, 3] is being loaded)
     assert cpu_manager.prepare_store(to_keys([6, 7, 8]), _EMPTY_REQ_CTX) is None
@@ -442,6 +450,7 @@ def test_cpu_manager():
     # prepare store [6, 7, 8] -> evicts [4, 5, 2] (oldest)
     prepare_store_output = cpu_manager.prepare_store(to_keys([6, 7, 8]), _EMPTY_REQ_CTX)
     verify_store_output(
+        cpu_manager,
         prepare_store_output,
         ExpectedPrepareStoreOutput(
             keys_to_store=[6, 7, 8],
@@ -459,6 +468,7 @@ def test_cpu_manager():
     # prepare store [7, 9] -> evicts [8] (oldest following previous touch)
     prepare_store_output = cpu_manager.prepare_store(to_keys([9]), _EMPTY_REQ_CTX)
     verify_store_output(
+        cpu_manager,
         prepare_store_output,
         ExpectedPrepareStoreOutput(
             keys_to_store=[9],
@@ -481,7 +491,7 @@ def test_cpu_manager():
     )
 
 
-def test_prepare_load_preserves_key_order():
+def test_get_spec_preserves_key_order():
     """block_ids[i] must correspond to keys[i] (co-indexed invariant)."""
     manager = make_cpu_manager(num_blocks=4, cache_policy="lru")
 
@@ -490,15 +500,15 @@ def test_prepare_load_preserves_key_order():
     # Store all three keys and learn their block ID assignments
     store_output = manager.prepare_store([key_a, key_b, key_c], _EMPTY_REQ_CTX)
     assert store_output is not None
-    assert isinstance(store_output.store_spec, CPULoadStoreSpec)
+    store_spec = manager.get_spec(store_output.keys_to_store)
     key_to_block_id = {
-        k: int(bid)
-        for k, bid in zip(store_output.keys_to_store, store_output.store_spec.block_ids)
+        k: int(bid) for k, bid in zip(store_output.keys_to_store, store_spec.block_ids)
     }
     manager.complete_store([key_a, key_b, key_c], _EMPTY_REQ_CTX)
 
     # Forward order: [a, b, c]
-    spec_fwd = manager.prepare_load([key_a, key_b, key_c], _EMPTY_REQ_CTX)
+    assert manager.prepare_load([key_a, key_b, key_c], _EMPTY_REQ_CTX) is None
+    spec_fwd = manager.get_spec([key_a, key_b, key_c])
     assert isinstance(spec_fwd, CPULoadStoreSpec)
     assert [int(x) for x in spec_fwd.block_ids] == [
         key_to_block_id[key_a],
@@ -508,7 +518,8 @@ def test_prepare_load_preserves_key_order():
     manager.complete_load([key_a, key_b, key_c], _EMPTY_REQ_CTX)  # order irrelevant
 
     # Arbitrary permutation: [b, c, a]
-    spec_perm = manager.prepare_load([key_b, key_c, key_a], _EMPTY_REQ_CTX)
+    assert manager.prepare_load([key_b, key_c, key_a], _EMPTY_REQ_CTX) is None
+    spec_perm = manager.get_spec([key_b, key_c, key_a])
     assert isinstance(spec_perm, CPULoadStoreSpec)
     assert [int(x) for x in spec_perm.block_ids] == [
         key_to_block_id[key_b],
@@ -516,6 +527,31 @@ def test_prepare_load_preserves_key_order():
         key_to_block_id[key_a],
     ]
     manager.complete_load([key_a, key_b, key_c], _EMPTY_REQ_CTX)  # order irrelevant
+
+    empty_spec = manager.get_spec([])
+    assert isinstance(empty_spec, CPULoadStoreSpec)
+    assert empty_spec.block_ids.size == 0
+
+
+def test_get_spec_does_not_pin_blocks():
+    manager = make_cpu_manager(num_blocks=2, cache_policy="lru")
+    first_key, second_key = to_key(0), to_key(1)
+
+    store_output = manager.prepare_store([first_key, second_key], _EMPTY_REQ_CTX)
+    assert store_output is not None
+    manager.complete_store([first_key, second_key], _EMPTY_REQ_CTX)
+
+    first_spec = manager.get_spec([first_key])
+    second_spec = manager.get_spec([first_key])
+    first_spec.block_ids[0] = -1
+    assert second_spec.block_ids.tolist() == [0]
+
+    replacement = manager.prepare_store([to_key(2)], _EMPTY_REQ_CTX)
+    assert replacement is not None
+    assert replacement.evicted_keys == [first_key]
+
+    with pytest.raises(AssertionError, match="not found in cache"):
+        manager.get_spec([to_key(99)])
 
 
 class TestARCPolicy:
@@ -545,6 +581,7 @@ class TestARCPolicy:
             to_keys([1, 2]), _EMPTY_REQ_CTX
         )
         verify_store_output(
+            cpu_manager,
             prepare_store_output,
             ExpectedPrepareStoreOutput(
                 keys_to_store=[1, 2],
@@ -607,6 +644,7 @@ class TestARCPolicy:
             to_keys([1, 2, 3, 4]), _EMPTY_REQ_CTX
         )
         verify_store_output(
+            cpu_manager,
             prepare_store_output,
             ExpectedPrepareStoreOutput(
                 keys_to_store=[1, 2, 3, 4],
@@ -617,8 +655,9 @@ class TestARCPolicy:
         cpu_manager.complete_store(to_keys([1, 2, 3, 4]), _EMPTY_REQ_CTX)
 
         # prepare load [2, 3] (increases ref_cnt)
-        prepare_load_output = cpu_manager.prepare_load(to_keys([2, 3]), _EMPTY_REQ_CTX)
-        verify_load_output(prepare_load_output, [1, 2])
+        load_keys = to_keys([2, 3])
+        cpu_manager.prepare_load(load_keys, _EMPTY_REQ_CTX)
+        verify_load_output(cpu_manager, load_keys, [1, 2])
 
         # prepare store [5, 6, 7] with [2, 3] being loaded
         # should fail because [2, 3] have ref_cnt > 0
@@ -843,6 +882,7 @@ class TestARCPolicy:
         # store block 5, should evict from T1 (block 2, only one in T1)
         prepare_store_output = cpu_manager.prepare_store(to_keys([5]), _EMPTY_REQ_CTX)
         verify_store_output(
+            cpu_manager,
             prepare_store_output,
             ExpectedPrepareStoreOutput(
                 keys_to_store=[5],

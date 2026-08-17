@@ -16,8 +16,8 @@ Key Design Principles:
    primary tier before GPU can access them
 4. Transparent retry mechanism — Return None from lookup() to signal
    "data is being promoted, try later"
-5. ref_cnt as eviction protection — primary.prepare_read() increments ref_cnt,
-   protecting blocks from eviction until complete_read() is called
+5. ref_cnt as eviction protection — primary.prepare_load() increments ref_cnt,
+   protecting blocks from eviction until complete_load() is called
 """
 
 import time
@@ -82,14 +82,7 @@ class JobMetadata(NamedTuple):
 
 
 class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
-    """CPUOffloadingManager with a primary/secondary transfer interface.
-
-    The inherited prepare_store/complete_store/prepare_load/complete_load are the
-    GPU-facing OffloadingManager interface. These aliases expose the same operations
-    from the secondary tier perspective, where read/write refers to secondary
-    accessing primary. This avoids confusion when reading TieringOffloadingManager
-    code (e.g. calling prepare_load inside a cascade/store path would be misleading).
-    """
+    """CPUOffloadingManager backed by a shared offload memory region."""
 
     def __init__(
         self,
@@ -106,14 +99,6 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
             enable_events=enable_events,
         )
         self._mmap_region = mmap_region
-        # read/write is for CPU<->secondary transfers,
-        # load/store is for CPU<->GPU transfers.
-        # These aliases avoid calling prepare_load inside a store path.
-        self.prepare_read = self.prepare_load
-        self.complete_read = self.complete_load
-        self.prepare_write = self.prepare_store
-        self.complete_write = self.complete_store
-
         self._kv_memoryview = mmap_region.create_kv_memoryview()
 
     def get_kv_memoryview(self) -> memoryview:
@@ -283,13 +268,13 @@ class TieringOffloadingManager(OffloadingManager):
             failed_keys = transfer_job.keys
 
         if successful_keys:
-            self.primary_tier.complete_write(
+            self.primary_tier.complete_store(
                 successful_keys,
                 transfer_job.req_context,
                 True,
             )
         if failed_keys:
-            self.primary_tier.complete_write(
+            self.primary_tier.complete_store(
                 failed_keys,
                 transfer_job.req_context,
                 False,
@@ -301,9 +286,9 @@ class TieringOffloadingManager(OffloadingManager):
 
         This method:
         1. Calls get_finished_jobs() on each secondary tier
-        2. For completed stores (primary→secondary): calls primary.complete_read()
+        2. For completed stores (primary→secondary): calls primary.complete_load()
            to decrement ref_cnt
-        3. For completed loads (secondary→primary): calls primary.complete_write()
+        3. For completed loads (secondary→primary): calls primary.complete_store()
            to make blocks available
         """
         for i, tier in enumerate(self.secondary_tiers):
@@ -328,7 +313,7 @@ class TieringOffloadingManager(OffloadingManager):
                 else:
                     # primary→secondary transfer completed.
                     # Decrement ref_cnt on primary blocks.
-                    self.primary_tier.complete_read(
+                    self.primary_tier.complete_load(
                         transfer_job.keys, transfer_job.req_context
                     )
 
@@ -434,7 +419,7 @@ class TieringOffloadingManager(OffloadingManager):
         Args:
             tier_idx: The secondary tier index to promote from
             key: Block to promote
-            req_context: Per-request context forwarded to primary.prepare_write().
+            req_context: Per-request context forwarded to primary.prepare_store().
 
         Returns:
             True if promotion was initiated, False if primary tier is full.
@@ -443,7 +428,7 @@ class TieringOffloadingManager(OffloadingManager):
         # Must happen immediately so primary.lookup() returns None (in-flight)
         # for this key on any subsequent lookup() call within the same step,
         # preventing duplicate promotion attempts.
-        primary_write_result = self.primary_tier.prepare_write([key], req_context)
+        primary_write_result = self.primary_tier.prepare_store([key], req_context)
 
         if primary_write_result is None:
             # Primary tier is full; caller should treat the block as unavailable
@@ -451,7 +436,10 @@ class TieringOffloadingManager(OffloadingManager):
             self._metrics.on_promotion_allocation_failure()
             return False
 
-        store_spec = primary_write_result.store_spec
+        if not primary_write_result.keys_to_store:
+            return False
+
+        store_spec = self.primary_tier.get_spec(primary_write_result.keys_to_store)
         assert isinstance(store_spec, CPULoadStoreSpec)
         # Defer submit_load to on_schedule_end(). Group by (tier, request) so
         # each request's blocks are submitted as one batched job per tier.
@@ -494,7 +482,7 @@ class TieringOffloadingManager(OffloadingManager):
     @override
     def prepare_load(
         self, keys: Collection[OffloadKey], req_context: ReqContext
-    ) -> LoadStoreSpec:
+    ) -> None:
         """
         Prepare blocks to be loaded from primary tier to GPU.
 
@@ -508,10 +496,12 @@ class TieringOffloadingManager(OffloadingManager):
             keys: Blocks to prepare for loading.
             req_context: Per-request context.
 
-        Returns:
-            LoadStoreSpec for reading from primary tier.
         """
-        return self.primary_tier.prepare_load(keys, req_context)
+        self.primary_tier.prepare_load(keys, req_context)
+
+    @override
+    def get_spec(self, keys: Sequence[OffloadKey]) -> LoadStoreSpec:
+        return self.primary_tier.get_spec(keys)
 
     @override
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext):
@@ -569,7 +559,7 @@ class TieringOffloadingManager(OffloadingManager):
         #    create_store_job()): decrements ref_cnt on the primary blocks
         #    that were read, making them evictable again once ref_cnt hits 0.
         #  - Promotion completions (secondary->primary loads): sets a
-        #    not-yet-ready block's ref_cnt from -1 to 0 via complete_write(),
+        #    not-yet-ready block's ref_cnt from -1 to 0 via complete_store(),
         #    making it evictable for the first time.
         # Both must be accounted for before the eviction decision below.
         self._maybe_process_finished_jobs()
@@ -640,25 +630,22 @@ class TieringOffloadingManager(OffloadingManager):
         secondary tiers.
 
         For each secondary tier:
-        1. Call primary.prepare_read() to get LoadStoreSpec AND increment
-           ref_cnt (protecting blocks during async transfer)
+        1. Call primary.prepare_load() to increment ref_cnt, then get_spec()
+           to materialize block IDs for the async transfer
         2. Call tier.submit_store() to start async transfer: primary→secondary
         3. Track the job in _store_jobs dictionary
 
         Args:
             keys: Blocks that finished storing.
             success: Whether the GPU→primary transfer succeeded.
-            req_context: Per-request context forwarded to primary.prepare_read().
+            req_context: Per-request context forwarded to primary.prepare_load().
         """
         # Step 1: Complete store in primary tier (makes blocks loadable)
         self.primary_tier.complete_store(keys, req_context, success)
 
         if success:
-            # Step 2: Cascade to ALL secondary tiers
-            # For each secondary tier, call primary.prepare_read() to get the
-            # LoadStoreSpec AND to increment ref_cnt (protecting blocks from
-            # eviction during the async transfer). One prepare_read() call per
-            # secondary tier.
+            # Step 2: Cascade to ALL secondary tiers. Each job independently
+            # protects the primary blocks until that job completes.
             for tier_idx, tier in enumerate(self.secondary_tiers):
                 job_metadata = self.create_store_job(keys, req_context, tier_idx)
                 tier.submit_store(job_metadata)
@@ -679,19 +666,20 @@ class TieringOffloadingManager(OffloadingManager):
     ) -> TransferJob:
         """Pin blocks in the primary tier and create a tracked store job.
 
-        Calls prepare_read() to increment ref_cnt (protecting blocks
-        from eviction during the async transfer), allocates a job ID,
-        and registers the job in _jobs.
+        Calls prepare_load() to increment ref_cnt, materializes block IDs in
+        the same key order, allocates a job ID, and registers the job in _jobs.
 
         The caller is responsible for the actual data transfer and
         reporting completion via get_finished_jobs().
         """
-        primary_blocks_spec = self.primary_tier.prepare_read(keys, req_context)
+        ordered_keys = tuple(keys)
+        self.primary_tier.prepare_load(ordered_keys, req_context)
+        primary_blocks_spec = self.primary_tier.get_spec(ordered_keys)
         assert isinstance(primary_blocks_spec, CPULoadStoreSpec)
         job_id = self._next_job_id()
         job_metadata = TransferJob(
             job_id=job_id,
-            keys=keys,
+            keys=ordered_keys,
             block_ids=primary_blocks_spec.block_ids,
             is_promotion=False,
             req_context=req_context,

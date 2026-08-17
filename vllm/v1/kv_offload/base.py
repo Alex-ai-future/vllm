@@ -145,8 +145,13 @@ class LoadStoreSpec:
 
 @dataclass
 class PrepareStoreOutput:
+    """Result of reserving capacity for a store operation.
+
+    ``keys_to_store`` is the ordered subsequence of input keys accepted for
+    storing.
+    """
+
     keys_to_store: list[OffloadKey]
-    store_spec: LoadStoreSpec
     evicted_keys: list[OffloadKey]
 
 
@@ -169,8 +174,6 @@ The class provides the following primitives:
     lookup() - check whether a single block is offloaded and ready.
     prepare_load() - prepare given blocks to be read.
         The given blocks will be protected from eviction.
-        This function returns a LoadSpec which encapsulates
-        information required for performing the load.
     touch() - marks the give blocks as recently used. Can be used
         to track block's LRU. This function is separated from the
         prepare_load function to allow setting block recency even
@@ -179,8 +182,10 @@ The class provides the following primitives:
     complete_load() - mark blocks which were previously prepared to be
         loaded as done loading. This is to re-allow their eviction.
     prepare_store() - prepare the given blocks to be written.
-        Returns a StoreSpec encapsulating offloading information,
+        Returns the ordered input subsequence accepted for storing,
         as well as a list of blocks that were evicted as a result.
+    get_spec() - materialize medium-specific addresses for prepared blocks
+        in the given key order.
     complete_store() - marks a previous store as completed.
         Following this call, the given blocks will become loadable.
 """
@@ -239,7 +244,7 @@ class OffloadingManager(ABC):
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
-    ) -> LoadStoreSpec:
+    ) -> None:
         """
         Prepare the given blocks to be read.
         The given blocks will be protected from eviction until
@@ -250,9 +255,21 @@ class OffloadingManager(ABC):
             keys: the keys identifying the blocks.
             req_context: per-request context (e.g. kv_transfer_params).
 
+        """
+        pass
+
+    @abstractmethod
+    def get_spec(self, keys: Sequence[OffloadKey]) -> LoadStoreSpec:
+        """Materialize addresses for prepared keys in input order.
+
+        This method must not allocate blocks or modify cache lifecycle state.
+        Empty input must return the backend's empty spec.
+
+        Args:
+            keys: Prepared keys in the order expected by the worker.
+
         Returns:
-            A LoadStoreSpec that can be used by a worker to locate and load
-            the actual offloaded KV data.
+            A backend-specific spec containing addresses in the same order.
         """
         pass
 
@@ -293,9 +310,8 @@ class OffloadingManager(ABC):
             req_context: per-request context (e.g. kv_transfer_params).
 
         Returns:
-            A PrepareStoreOutput indicating which blocks need storing,
-            where to store them (LoadStoreSpec), and list of blocks that
-            were evicted as a result.
+            A PrepareStoreOutput indicating the ordered input subsequence
+            accepted for storing and the blocks evicted as a result.
             None is returned if the blocks cannot be stored.
         """
         pass

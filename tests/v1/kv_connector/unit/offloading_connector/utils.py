@@ -127,7 +127,8 @@ class MockOffloadingSpec(OffloadingSpec):
         super().__init__(config)
 
         self.manager = MagicMock(spec=OffloadingManager)
-        self.manager.prepare_load = lambda keys, req_context: MockLoadStoreSpec(keys)
+        self.manager.prepare_load.return_value = None
+        self.manager.get_spec.side_effect = lambda keys: MockLoadStoreSpec(keys)
         self.manager.lookup.return_value = LookupResult.MISS
         self.manager.get_stats.return_value = None
         self.manager.on_new_request.return_value = RequestOffloadingContext()
@@ -691,6 +692,5 @@ def generate_store_output(keys: Iterable[OffloadKey]):
     keys = list(keys)
     return PrepareStoreOutput(
         keys_to_store=list(keys),
-        store_spec=MockLoadStoreSpec(keys),
         evicted_keys=[],
     )

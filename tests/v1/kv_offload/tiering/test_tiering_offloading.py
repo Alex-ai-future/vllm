@@ -313,7 +313,7 @@ class TestTieringOffloadingManager:
             patch.object(
                 self.secondary_tier1, "get_finished_jobs", return_value=[failed]
             ),
-            patch.object(self.primary_tier, "complete_write") as completed,
+            patch.object(self.primary_tier, "complete_store") as completed,
         ):
             self.manager._process_finished_jobs()
         completed.assert_called_once_with(to_keys([1, 2]), _CTX, False)
@@ -338,7 +338,7 @@ class TestTieringOffloadingManager:
         ok = JobResult(job_id=job_id, success=True)
         with (
             patch.object(self.secondary_tier1, "get_finished_jobs", return_value=[ok]),
-            patch.object(self.primary_tier, "complete_write") as completed,
+            patch.object(self.primary_tier, "complete_store") as completed,
         ):
             self.manager._process_finished_jobs()
         completed.assert_called_once_with(to_keys([1]), _CTX, True)
@@ -446,7 +446,7 @@ class TestTieringOffloadingManager:
         assert len(self.secondary_tier2.completed_jobs) > 0
 
         # End of step 2: flag was reset, so _maybe_process_finished_jobs()
-        # runs and processes the cascade completions (complete_read → ref_cnt--)
+        # runs and processes the cascade completions (complete_load → ref_cnt--)
         self._simulate_on_schedule_end()
 
         # After cascade completes, ref_cnt should be 0

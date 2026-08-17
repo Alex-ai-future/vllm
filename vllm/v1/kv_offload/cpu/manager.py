@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Sequence
 
 from typing_extensions import override
 
@@ -9,7 +9,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
 )
 from vllm.v1.kv_offload.base import (
-    LoadStoreSpec,
     LookupResult,
     Medium,
     OffloadingEvent,
@@ -96,13 +95,6 @@ class CPUOffloadingManager(OffloadingManager):
     def _free_block(self, block: BlockStatus) -> None:
         self._free_list.append(block.block_id)
 
-    def _get_load_store_spec(
-        self,
-        keys: Iterable[OffloadKey],
-        blocks: Iterable[BlockStatus],
-    ) -> CPULoadStoreSpec:
-        return CPULoadStoreSpec([block.block_id for block in blocks])
-
     # --- OffloadingManager interface ---
 
     @override
@@ -131,8 +123,7 @@ class CPUOffloadingManager(OffloadingManager):
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
-    ) -> LoadStoreSpec:
-        blocks = []
+    ) -> None:
         for key in keys:
             block = self._policy.get(key)
             assert block is not None, f"Block {key!r} not found in cache"
@@ -142,8 +133,15 @@ class CPUOffloadingManager(OffloadingManager):
                 self._num_evictable_cache_blocks -= 1  # ref_cnt 0 -> 1
                 assert self._num_evictable_cache_blocks >= 0
             block.ref_cnt += 1
-            blocks.append(block)
-        return self._get_load_store_spec(keys, blocks)
+
+    @override
+    def get_spec(self, keys: Sequence[OffloadKey]) -> CPULoadStoreSpec:
+        block_ids: list[int] = []
+        for key in keys:
+            block = self._policy.get(key)
+            assert block is not None, f"Block {key!r} not found in cache"
+            block_ids.append(block.block_id)
+        return CPULoadStoreSpec(block_ids)
 
     @override
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
@@ -178,7 +176,6 @@ class CPUOffloadingManager(OffloadingManager):
         if not keys_to_store:
             return PrepareStoreOutput(
                 keys_to_store=[],
-                store_spec=self._get_load_store_spec([], []),
                 evicted_keys=[],
             )
 
@@ -226,12 +223,8 @@ class CPUOffloadingManager(OffloadingManager):
             self._policy.insert(key, block)
         self._num_write_pending_blocks += len(keys_to_store)
 
-        # build store specs for allocated blocks
-        store_spec = self._get_load_store_spec(keys_to_store, blocks)
-
         return PrepareStoreOutput(
             keys_to_store=keys_to_store,
-            store_spec=store_spec,
             evicted_keys=to_evict,
         )
 
