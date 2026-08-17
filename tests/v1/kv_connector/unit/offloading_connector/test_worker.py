@@ -27,6 +27,7 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
     CanonicalKVCaches,
     GPULoadStoreSpec,
+    GroupTransfer,
     LoadStoreSpec,
     OffloadingManager,
     OffloadingSpec,
@@ -150,8 +151,7 @@ def _store_metadata(job_id: int) -> OffloadingConnectorMetadata:
         store_jobs={
             job_id: TransferJob(
                 req_id="req",
-                src_spec=GPULoadStoreSpec([0], group_sizes=(1,), block_indices=(0,)),
-                dst_spec=LoadStoreSpec(),
+                groups=(GroupTransfer(GPULoadStoreSpec([0]), LoadStoreSpec()),),
             )
         },
     )
@@ -162,8 +162,7 @@ def _load_metadata(job_id: int) -> OffloadingConnectorMetadata:
         load_jobs={
             job_id: TransferJob(
                 req_id="req",
-                src_spec=LoadStoreSpec(),
-                dst_spec=GPULoadStoreSpec([0], group_sizes=(1,), block_indices=(0,)),
+                groups=(GroupTransfer(GPULoadStoreSpec([0]), LoadStoreSpec()),),
             )
         },
         store_jobs={},

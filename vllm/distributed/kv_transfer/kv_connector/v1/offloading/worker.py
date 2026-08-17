@@ -29,8 +29,7 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
     CanonicalKVCaches,
     CanonicalKVCacheTensor,
-    GPULoadStoreSpec,
-    LoadStoreSpec,
+    GroupTransfer,
     OffloadingSpec,
     OffloadingWorker,
 )
@@ -58,9 +57,7 @@ class OffloadingConnectorWorker:
 
         # job_id -> req_id for in-flight loads.
         self._load_jobs: dict[int, ReqId] = {}
-        self._unsubmitted_store_jobs: list[
-            tuple[int, GPULoadStoreSpec, LoadStoreSpec]
-        ] = []
+        self._unsubmitted_store_jobs: list[tuple[int, tuple[GroupTransfer, ...]]] = []
         self._connector_worker_meta = OffloadingWorkerMetadata()
 
     def _init_worker(self, kv_caches: CanonicalKVCaches) -> None:
@@ -301,15 +298,11 @@ class OffloadingConnectorWorker:
                     if not self._is_store_writer:
                         self._connector_worker_meta.mark_completed(job_id)
                         continue
-                    assert isinstance(entry.src_spec, GPULoadStoreSpec)
-                    self._unsubmitted_store_jobs.append(
-                        (job_id, entry.src_spec, entry.dst_spec)
-                    )
+                    self._unsubmitted_store_jobs.append((job_id, entry.groups))
 
         # Submit deferred stores from previous step (and jobs_to_flush above).
-        for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
-            assert isinstance(src_spec, GPULoadStoreSpec)
-            success = self.worker.submit_store(job_id, src_spec, dst_spec)
+        for job_id, groups in self._unsubmitted_store_jobs:
+            success = self.worker.submit_store(job_id, groups)
             assert success
         self._unsubmitted_store_jobs.clear()
 
@@ -318,15 +311,14 @@ class OffloadingConnectorWorker:
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
         assert self.worker is not None
-        for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
-            success = self.worker.submit_store(job_id, src_spec, dst_spec)
+        for job_id, groups in self._unsubmitted_store_jobs:
+            success = self.worker.submit_store(job_id, groups)
             assert success
         self._unsubmitted_store_jobs.clear()
 
         for job_id, entry in metadata.load_jobs.items():
             self._load_jobs[job_id] = entry.req_id
-            assert isinstance(entry.dst_spec, GPULoadStoreSpec)
-            success = self.worker.submit_load(job_id, entry.src_spec, entry.dst_spec)
+            success = self.worker.submit_load(job_id, entry.groups)
             assert success
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
@@ -338,10 +330,7 @@ class OffloadingConnectorWorker:
             # NOTE(orozery): defer the store to the beginning of the next
             # engine step, so that offloading starts AFTER transfers related
             # to token sampling, thereby avoiding delays to token generation.
-            assert isinstance(entry.src_spec, GPULoadStoreSpec)
-            self._unsubmitted_store_jobs.append(
-                (job_id, entry.src_spec, entry.dst_spec)
-            )
+            self._unsubmitted_store_jobs.append((job_id, entry.groups))
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """

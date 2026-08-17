@@ -8,7 +8,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, NewType, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, NewType, Self, TypeVar
 
 import numpy as np
 import torch
@@ -141,6 +141,15 @@ class LoadStoreSpec:
     Metadata that encapsulates information allowing a worker
     to load, and optionally also to store, blocks of KV data.
     """
+
+    @property
+    def gpu_block_offset(self) -> int:
+        return getattr(self, "_gpu_block_offset", 0)
+
+    def set_gpu_block_offset(self, offset: int) -> Self:
+        assert offset >= 0
+        self._gpu_block_offset = offset
+        return self
 
 
 @dataclass
@@ -415,7 +424,7 @@ class BlockIDsLoadStoreSpec(LoadStoreSpec, ABC):
     Spec for loading/storing KV blocks from given block numbers.
     """
 
-    def __init__(self, block_ids: list[int]):
+    def __init__(self, block_ids: Sequence[int]):
         self.block_ids = np.array(block_ids, dtype=np.int64)
 
     def __repr__(self) -> str:
@@ -423,37 +432,15 @@ class BlockIDsLoadStoreSpec(LoadStoreSpec, ABC):
 
 
 class GPULoadStoreSpec(BlockIDsLoadStoreSpec):
-    """
-    Spec for loading/storing a KV block to GPU memory.
+    """Spec for loading or storing blocks from one GPU KV cache group."""
 
-    If there are multiple KV groups, the blocks are expected to be
-    ordered by the group index.
-    In that case, group_sizes[i] determines the number of blocks
-    per the i-th KV group, and thus sum(group_sizes) == len(block_ids).
-    group_sizes=None indicates a single KV group.
 
-    If block_indices is given, each group (determined by group_sizes) of block IDs
-    will correspond to logically contiguous blocks, e.g. blocks 5-10 of a some request.
-    block_indices[i] will represent the block index of the first block in group #i.
-    Thus, len(block_indices) == len(group_sizes) = number of KV cache groups.
-    This information is required in order to support off/loading from offloaded blocks
-    which are larger than GPU blocks.
-    In such cases, the first GPU block per each group may be unaligned to the offloaded
-    block size, and so knowing block_indices[i] allows the worker to correctly
-    skip part of the first matching offloaded block.
-    """
+@dataclass(frozen=True)
+class GroupTransfer:
+    """Transfer specs for one positional KV cache group."""
 
-    def __init__(
-        self,
-        block_ids: list[int],
-        group_sizes: Sequence[int],
-        block_indices: Sequence[int],
-    ):
-        super().__init__(block_ids)
-        assert sum(group_sizes) == len(block_ids)
-        assert len(block_indices) == len(group_sizes)
-        self.group_sizes: Sequence[int] = group_sizes
-        self.block_indices: Sequence[int] = block_indices
+    gpu_spec: GPULoadStoreSpec
+    offload_spec: LoadStoreSpec
 
 
 @dataclass
@@ -564,15 +551,11 @@ class OffloadingWorker(ABC):
     submit_load, so there is no (src_medium, dst_medium) routing."""
 
     @abstractmethod
-    def submit_store(
-        self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
-    ) -> bool:
+    def submit_store(self, job_id: int, groups: tuple[GroupTransfer, ...]) -> bool:
         """Async GPU -> offloaded medium."""
 
     @abstractmethod
-    def submit_load(
-        self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec
-    ) -> bool:
+    def submit_load(self, job_id: int, groups: tuple[GroupTransfer, ...]) -> bool:
         """Async offloaded medium -> GPU."""
 
     @abstractmethod

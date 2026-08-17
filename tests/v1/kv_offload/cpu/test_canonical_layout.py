@@ -12,6 +12,7 @@ from vllm.v1.kv_offload.base import (
     CanonicalPageMapping,
     CopyRun,
     GPULoadStoreSpec,
+    GroupTransfer,
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.gpu_worker import (
@@ -95,12 +96,13 @@ def _whole_page_mapping() -> CanonicalPageMapping:
 
 def _transfer(handler, num_blocks: int, gpu_to_cpu: bool) -> None:
     block_ids = list(range(num_blocks))
-    gpu_spec = GPULoadStoreSpec(
-        block_ids, group_sizes=(num_blocks,), block_indices=(0,)
+    groups = (
+        GroupTransfer(
+            gpu_spec=GPULoadStoreSpec(block_ids),
+            offload_spec=CPULoadStoreSpec(block_ids),
+        ),
     )
-    cpu_spec = CPULoadStoreSpec(block_ids)
-    src, dst = (gpu_spec, cpu_spec) if gpu_to_cpu else (cpu_spec, gpu_spec)
-    assert handler.transfer_async(0, src, dst)
+    assert handler.transfer_async(0, groups)
     deadline = time.time() + 30
     while time.time() < deadline:
         if handler.get_finished():

@@ -44,7 +44,6 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.kv_offload.base import (
-    GPULoadStoreSpec,
     LookupResult,
     Medium,
     OffloadingEvent,
@@ -116,18 +115,15 @@ def test_partial_tail_store_uses_attention_and_recurrent_cow_sources():
 
     assert len(jobs) == 1
     [job_id] = jobs
-    src_spec = jobs[job_id].src_spec
-    assert isinstance(src_spec, GPULoadStoreSpec)
-    assert src_spec.block_ids.tolist() == [12, 99]
-    assert src_spec.group_sizes == [1, 1]
-    assert src_spec.block_indices == [1, 1]
+    groups = jobs[job_id].groups
+    assert [group.gpu_spec.block_ids.tolist() for group in groups] == [[12], [99]]
+    assert [group.offload_spec.gpu_block_offset for group in groups] == [1, 1]
     assert scheduler._block_id_to_pending_jobs == {
         12: {job_id},
         99: {job_id},
     }
     scheduler.manager.prepare_store.assert_called_once()
-    accepted_keys = scheduler.manager.prepare_store.call_args.args[0]
-    scheduler.manager.get_spec.assert_called_once_with(accepted_keys)
+    assert scheduler.manager.get_spec.call_count == 2
     assert scheduler.config.supports_partial_tail
 
     events = list(
@@ -181,14 +177,14 @@ def test_partial_lookup_returns_exact_boundary_and_group_load_keys():
         num_external_tokens=28,
     )
     [load_job] = scheduler._current_batch_load_jobs.values()
-    dst_spec = load_job.dst_spec
-    assert isinstance(dst_spec, GPULoadStoreSpec)
-    assert dst_spec.block_ids.tolist() == [31, 32, 41]
-    assert dst_spec.group_sizes == [2, 1]
-    assert dst_spec.block_indices == [0, 1]
+    groups = load_job.groups
+    assert [group.gpu_spec.block_ids.tolist() for group in groups] == [
+        [31, 32],
+        [41],
+    ]
+    assert [group.offload_spec.gpu_block_offset for group in groups] == [0, 1]
     scheduler.manager.prepare_load.assert_called_once()
-    load_keys = scheduler.manager.prepare_load.call_args.args[0]
-    scheduler.manager.get_spec.assert_called_once_with(load_keys)
+    assert scheduler.manager.get_spec.call_count == 2
     assert req_status.partial_tail_boundary is None
 
 

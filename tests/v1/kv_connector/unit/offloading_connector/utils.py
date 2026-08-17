@@ -44,7 +44,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
-    GPULoadStoreSpec,
+    GroupTransfer,
     LoadStoreSpec,
     LookupResult,
     OffloadingManager,
@@ -79,7 +79,7 @@ class MockLoadStoreSpec(LoadStoreSpec):
 
 class MockOffloadingWorker(OffloadingWorker):
     def __init__(self):
-        self.transfer_specs: dict[int, tuple[LoadStoreSpec, LoadStoreSpec]] = {}
+        self.transfer_specs: dict[int, tuple[bool, tuple[GroupTransfer, ...]]] = {}
         self.completed_transfers: list[TransferResult] = []
         self.waiting_jobs: set[int] = set()
         self.completed_jobs: list[int] = []
@@ -90,17 +90,13 @@ class MockOffloadingWorker(OffloadingWorker):
         self.completed_transfers = []
         return finished
 
-    def submit_store(
-        self, job_id: int, src_spec: LoadStoreSpec, dst_spec: LoadStoreSpec
-    ) -> bool:  # type: ignore[override]
-        self.transfer_specs[job_id] = (src_spec, dst_spec)
+    def submit_store(self, job_id: int, groups: tuple[GroupTransfer, ...]) -> bool:
+        self.transfer_specs[job_id] = (True, groups)
         self.waiting_jobs.add(job_id)
         return True
 
-    def submit_load(
-        self, job_id: int, src_spec: LoadStoreSpec, dst_spec: LoadStoreSpec
-    ) -> bool:  # type: ignore[override]
-        self.transfer_specs[job_id] = (src_spec, dst_spec)
+    def submit_load(self, job_id: int, groups: tuple[GroupTransfer, ...]) -> bool:
+        self.transfer_specs[job_id] = (False, groups)
         self.waiting_jobs.add(job_id)
         return True
 
@@ -143,7 +139,9 @@ class MockOffloadingSpec(OffloadingSpec):
     def complete_transfers(self):
         self.handler.complete_jobs(self.handler.waiting_jobs.copy())
 
-    def get_completed_transfers(self) -> list[tuple[LoadStoreSpec, LoadStoreSpec]]:
+    def get_completed_transfers(
+        self,
+    ) -> list[tuple[bool, tuple[GroupTransfer, ...]]]:
         specs = [
             self.handler.transfer_specs[job_id]
             for job_id in self.handler.completed_jobs
@@ -151,7 +149,9 @@ class MockOffloadingSpec(OffloadingSpec):
         self.handler.completed_jobs.clear()
         return specs
 
-    def get_flushed_transfers(self) -> list[tuple[LoadStoreSpec, LoadStoreSpec]]:
+    def get_flushed_transfers(
+        self,
+    ) -> list[tuple[bool, tuple[GroupTransfer, ...]]]:
         specs = [
             self.handler.transfer_specs[job_id] for job_id in self.handler.flushed_jobs
         ]
@@ -380,71 +380,34 @@ class RequestRunner:
         self.scheduler.add_request(req)
 
     def _parse_transfers(self):
-        for src_spec, dst_spec in self.offloading_spec.get_flushed_transfers():
-            if isinstance(src_spec, GPULoadStoreSpec):
-                # store flush
-                for block_id in src_spec.block_ids:
-                    self.flushed_gpu_blocks.add(self.gpu_blocks[block_id.item()])
-            else:
-                # load flush
-                for block_id in dst_spec.block_ids:
+        for _, groups in self.offloading_spec.get_flushed_transfers():
+            for group in groups:
+                for block_id in group.gpu_spec.block_ids:
                     self.flushed_gpu_blocks.add(self.gpu_blocks[block_id.item()])
 
         blocks_per_chunk = self.blocks_per_chunk
 
-        for src_spec, dst_spec in self.offloading_spec.get_completed_transfers():
-            if isinstance(src_spec, GPULoadStoreSpec):
-                store = True
-                gpu_spec = src_spec
-                offload_spec = dst_spec
-            else:
-                store = False
-                gpu_spec = dst_spec
-                offload_spec = src_spec
-
-            assert isinstance(offload_spec, MockLoadStoreSpec)
-            assert isinstance(gpu_spec, GPULoadStoreSpec)
-            assert len(gpu_spec.group_sizes) == self.num_kv_groups
-
+        for store, groups in self.offloading_spec.get_completed_transfers():
+            assert len(groups) == self.num_kv_groups
             gpu_blocks: list[GPUBlock] = []
-            for block_id in gpu_spec.block_ids:
-                gpu_blocks.append(self.gpu_blocks[block_id.item()])
-
-            # list of (offload_key, sub_block_offset)
             offload_addresses: list[Any] = []
-            for offload_key in offload_spec.offload_keys:
-                for sub_block_idx in range(blocks_per_chunk):
-                    offload_addresses.append((offload_key, sub_block_idx))
-
-            assert gpu_spec.block_indices is not None
-            assert len(gpu_spec.block_indices) == self.num_kv_groups
-
-            gpu_block_offset = 0
-            offload_address_offset = 0
-            for group_size, logical_offset in zip(
-                gpu_spec.group_sizes, gpu_spec.block_indices
-            ):
-                gpu_block_end_offset = gpu_block_offset + group_size
-                assert gpu_block_end_offset <= len(gpu_blocks)
-
-                offload_addresses_to_skip = logical_offset % blocks_per_chunk
-                offload_addresses_end_offset = (
-                    offload_address_offset + offload_addresses_to_skip + group_size
-                )
-                assert offload_addresses_end_offset <= len(offload_addresses)
-
-                offload_addresses = (
-                    offload_addresses[:offload_address_offset]
-                    + offload_addresses[
-                        offload_address_offset + offload_addresses_to_skip :
-                    ]
-                )
-
-                gpu_block_offset += group_size
-                offload_address_offset += group_size
-
-            assert gpu_block_offset == len(gpu_blocks)
-            assert offload_address_offset == len(offload_addresses)
+            for group in groups:
+                offload_spec = group.offload_spec
+                assert isinstance(offload_spec, MockLoadStoreSpec)
+                group_gpu_blocks = [
+                    self.gpu_blocks[block_id.item()]
+                    for block_id in group.gpu_spec.block_ids
+                ]
+                group_addresses = [
+                    (offload_key, sub_block_idx)
+                    for offload_key in offload_spec.offload_keys
+                    for sub_block_idx in range(blocks_per_chunk)
+                ]
+                skip = offload_spec.gpu_block_offset % blocks_per_chunk
+                group_addresses = group_addresses[skip : skip + len(group_gpu_blocks)]
+                assert len(group_addresses) == len(group_gpu_blocks)
+                gpu_blocks.extend(group_gpu_blocks)
+                offload_addresses.extend(group_addresses)
 
             transfer_summary = TransferSummary(gpu_blocks, offload_addresses)
             if store:

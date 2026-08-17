@@ -543,8 +543,10 @@ def test_get_spec_does_not_pin_blocks():
 
     first_spec = manager.get_spec([first_key])
     second_spec = manager.get_spec([first_key])
+    first_spec.set_gpu_block_offset(3)
     first_spec.block_ids[0] = -1
     assert second_spec.block_ids.tolist() == [0]
+    assert second_spec.gpu_block_offset == 0
 
     replacement = manager.prepare_store([to_key(2)], _EMPTY_REQ_CTX)
     assert replacement is not None
