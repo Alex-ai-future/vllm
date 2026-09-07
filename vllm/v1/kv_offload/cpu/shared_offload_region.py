@@ -12,7 +12,6 @@ import torch
 from vllm.distributed.device_communicators.shm_broadcast import (
     check_shm_free_space,
 )
-from vllm.distributed.parallel_state import is_local_first_rank
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
@@ -73,10 +72,10 @@ class SharedOffloadRegion:
     then mmap()s the full file. The O_EXCL winner removes the path only when
     initialization fails.
 
-    File path: /dev/shm/vllm_offload_{engine_id}.mmap.  When a barrier is
-    given, the ranked node-local rank-0 worker unlinks the path once every
-    worker has mapped the file. Otherwise, that worker unlinks the path during
-    cleanup. Mappings taken before the unlink stay valid.
+    File path: /dev/shm/vllm_offload_{engine_id}.mmap. When a barrier is
+    given, the caller-selected unlink owner removes the path once the barrier
+    releases. Without a barrier, that owner removes the path during cleanup.
+    Mappings taken before the unlink stay valid.
     """
 
     BLOCK_SIZE_ALIGNMENT: int = mmap.PAGESIZE
@@ -89,6 +88,8 @@ class SharedOffloadRegion:
         kv_bytes_per_chunk: int,
         cpu_page_size: int,
         barrier: Callable[[], None] | None = None,
+        *,
+        unlink_owner: bool,
     ) -> None:
         self.page_size = mmap.PAGESIZE
         assert kv_bytes_per_chunk % self.page_size == 0
@@ -99,7 +100,7 @@ class SharedOffloadRegion:
 
         self.rank = rank
         self.mmap_path = f"/dev/shm/vllm_offload_{engine_id}.mmap"
-        self._is_singleton_owner = rank is not None and is_local_first_rank()
+        self._is_unlink_owner = unlink_owner
         if rank is not None:
             # byte offset to this worker's first slot within each chunk row
             self._worker_offset = rank * cpu_page_size
@@ -168,15 +169,15 @@ class SharedOffloadRegion:
             try:
                 barrier()
             except Exception:
-                if self._is_singleton_owner:
+                if self._is_unlink_owner:
                     os.unlink(self.mmap_path)
-                    self._is_singleton_owner = False
+                    self._is_unlink_owner = False
                 self.mmap_obj.close()
                 os.close(self.fd)
                 raise
-            if self._is_singleton_owner:
+            if self._is_unlink_owner:
                 os.unlink(self.mmap_path)
-                self._is_singleton_owner = False
+                self._is_unlink_owner = False
                 logger.info("Unlinked mmap file %s", self.mmap_path)
 
         populate_write_fn = _get_populate_write_fn(self.mmap_obj)
@@ -338,7 +339,7 @@ class SharedOffloadRegion:
             except Exception:
                 logger.warning("Failed to close fd %s", self.fd, exc_info=True)
             self.fd = None
-        if self._is_singleton_owner and getattr(self, "mmap_path", None):
+        if self._is_unlink_owner and getattr(self, "mmap_path", None):
             try:
                 os.unlink(self.mmap_path)
                 logger.info("Removed mmap file %s", self.mmap_path)
@@ -348,4 +349,4 @@ class SharedOffloadRegion:
                 logger.warning(
                     "Failed to unlink path %s", self.mmap_path, exc_info=True
                 )
-            self._is_singleton_owner = False
+            self._is_unlink_owner = False
