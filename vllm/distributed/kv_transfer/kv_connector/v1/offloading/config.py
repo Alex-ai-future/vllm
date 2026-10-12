@@ -207,15 +207,14 @@ def build_offloading_config(
         and parallel_config.pipeline_parallel_size == 1
         and parallel_config.prefill_context_parallel_size == 1
         and parallel_config.decode_context_parallel_size == 1
-        # A replicated region is valid when this executor either aggregates
-        # all worker metadata into one scheduler or gives each rank its own
-        # independent scheduler.
+        # Shared regions require either one scheduler per rank or an
+        # aggregating scheduler whose worker world is engine-local.
         and (
-            (
+            per_rank_engine
+            or (
                 topology.scheduler_aggregates_worker_output
                 and scheduler_world_is_engine_local
             )
-            or per_rank_engine
         )
         and parallel_config.nnodes_within_dp == 1
     )
@@ -281,7 +280,7 @@ def build_offloading_config(
                 or per_rank_engine
                 or (
                     topology.scheduler_aggregates_worker_output
-                    and parallel_config.world_size == engine_world_size
+                    and scheduler_world_is_engine_local
                 )
             )
         )
@@ -300,7 +299,7 @@ def build_offloading_config(
                 or per_rank_engine
                 or (
                     topology.scheduler_aggregates_worker_output
-                    and parallel_config.world_size == engine_world_size
+                    and scheduler_world_is_engine_local
                 )
             )
         )
