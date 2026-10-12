@@ -1204,7 +1204,6 @@ def test_offloading_rank_and_size_belong_to_one_dp_replica(backend, tp, pp, pcp)
     )
     assert parallel.rank == expected_rank
     assert parallel.world_size == expected_world_size
-    assert parallel.engine_rank == 1
     assert parallel.engine_world_size == engine_size
 
 

@@ -337,7 +337,6 @@ def build_offloading_config(
             data_parallel_rank_local=parallel_config.data_parallel_rank_local,
             is_parallelism_agnostic=is_parallelism_agnostic,
             per_rank_engine=per_rank_engine,
-            engine_rank=parallel_config.rank % engine_world_size,
             engine_world_size=engine_world_size,
         ),
         replicated_layout=replicated_layout,

@@ -174,7 +174,6 @@ def _offloading_config(rank: int = 0) -> OffloadingConfig:
             data_parallel_size=1,
             data_parallel_rank_local=None,
             is_parallelism_agnostic=False,
-            engine_rank=rank,
             engine_world_size=2,
         ),
     )

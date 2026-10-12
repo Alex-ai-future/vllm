@@ -101,7 +101,6 @@ def _make_offloading_config(
             data_parallel_size=data_parallel_size,
             data_parallel_rank_local=data_parallel_rank_local,
             is_parallelism_agnostic=is_parallelism_agnostic,
-            engine_rank=rank % (tp_size if tp_size is not None else world_size),
             engine_world_size=(tp_size if tp_size is not None else world_size)
             * pp_size
             * pcp_size,
