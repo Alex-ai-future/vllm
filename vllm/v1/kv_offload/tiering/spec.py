@@ -356,7 +356,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     kv_bytes_per_chunk=self.kv_bytes_per_chunk,
                     cpu_page_size=self.cpu_page_size_per_worker,
                     barrier=(
-                        _shared_region_barrier
+                        lambda: _shared_region_barrier(True)
                         if self.config.parallel.per_rank_engine
                         else None
                     ),
@@ -454,7 +454,11 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 # All workers must have mapped the file before a failed worker
                 # aborts startup and removes its name. On success the
                 # scheduler mapping phase performs the final unlink.
-                barrier=_shared_region_barrier,
+                barrier=(
+                    (lambda: _shared_region_barrier(True))
+                    if self.config.parallel.per_rank_engine
+                    else _shared_region_barrier
+                ),
                 unlink_owner=False,
             )
             if self.config.canonical_layout:

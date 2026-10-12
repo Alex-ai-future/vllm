@@ -23,12 +23,23 @@ from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
 
-def _shared_region_barrier() -> None:
-    """Synchronize all ranks that may open the shared mmap region."""
+def _shared_region_barrier(per_rank_engine: bool = False) -> None:
+    """Synchronize ranks that may open the same shared mmap region.
+
+    A per-rank engine has one scheduler per TP group, so using the global
+    world group would couple otherwise independent DP engines. The fallback
+    groups preserve the existing MP/Ray behavior.
+    """
     from vllm.distributed.parallel_state import (
         get_inner_dp_world_group,
         get_world_group,
     )
+
+    if per_rank_engine:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        get_tp_group().barrier()
+        return
 
     try:
         group = get_inner_dp_world_group()
@@ -198,7 +209,9 @@ class CPUOffloadingSpec(OffloadingSpec):
                 rank=rank,
                 kv_bytes_per_chunk=self.kv_bytes_per_chunk,
                 cpu_page_size=self.cpu_page_size_per_worker,
-                barrier=_shared_region_barrier,
+                barrier=lambda: _shared_region_barrier(
+                    self.config.parallel.per_rank_engine is True
+                ),
                 unlink_owner=worker_rank == 0,
             )
         try:

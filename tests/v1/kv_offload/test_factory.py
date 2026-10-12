@@ -351,9 +351,21 @@ def test_tiering_spec_scheduler_region_uses_startup_barrier(monkeypatch):
 
     spec.get_manager()
 
-    assert region_calls[0]["barrier"] is barrier
-    barrier.assert_called_once_with()
+    assert callable(region_calls[0]["barrier"])
+    barrier.assert_called_once_with(True)
     region.unlink.assert_called_once_with()
+
+
+def test_per_rank_shared_region_barrier_uses_tp_group(monkeypatch):
+    import vllm.distributed.parallel_state as parallel_state
+    import vllm.v1.kv_offload.cpu.spec as cpu_spec_module
+
+    tp_group = SimpleNamespace(barrier=MagicMock())
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp_group)
+
+    cpu_spec_module._shared_region_barrier(per_rank_engine=True)
+
+    tp_group.barrier.assert_called_once_with()
 
 
 @pytest.mark.parametrize("world_size", [2, 4, 8])
