@@ -195,6 +195,11 @@ def build_offloading_config(
         if len(kv_cache_config.kv_cache_groups) == 1
         else None
     )
+    # Aggregating executors use an engine-local worker world. External
+    # launchers include all DP engines in world_size and use the per-rank path.
+    scheduler_world_is_engine_local = (
+        parallel_config.world_size == engine_world_size
+    )
     replicated_layout = (
         vllm_config.model_config.use_mla
         and parallel_config.tensor_parallel_size > 1
@@ -210,7 +215,7 @@ def build_offloading_config(
         and (
             (
                 topology.scheduler_aggregates_worker_output
-                and parallel_config.world_size == engine_world_size
+                and scheduler_world_is_engine_local
             )
             or per_rank_engine
         )
