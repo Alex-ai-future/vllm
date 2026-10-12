@@ -176,7 +176,12 @@ class CPUOffloadingSpec(OffloadingSpec):
     @property
     def worker_rank(self) -> int:
         """Return this worker's rank within its local engine topology."""
-        return self.config.parallel.engine_rank
+        worker_world_size = self.config.parallel.world_size
+        if self.config.parallel.per_rank_engine:
+            worker_world_size = self.config.parallel.engine_world_size
+        from vllm.distributed.parallel_state import get_world_group
+
+        return get_world_group().local_rank % worker_world_size
 
     def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
         mmap_region: SharedOffloadRegion | None = None
