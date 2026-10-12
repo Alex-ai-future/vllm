@@ -51,11 +51,11 @@ class OffloadingConnectorWorker:
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.worker: OffloadingWorker | None = None
-        # Non-writers still ack: pending_count waits for world_size per job.
         self._is_store_writer = (
             not self.spec.replicated_layout
             or self.spec.config.canonical_layout
             or self.spec.config.parallel.rank == 0
+            or self.spec.config.parallel.per_rank_engine
         )
 
         # job_id -> req_id for in-flight loads.

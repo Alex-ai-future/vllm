@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Translate vLLM KV cache metadata for native offloading backends."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from vllm.utils.math_utils import round_up
 from vllm.v1.core.kv_cache_utils import (
@@ -31,6 +31,34 @@ from vllm.v1.kv_offload.config import (
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+
+
+class _ExecutorTopology(NamedTuple):
+    """Executor properties that affect offloading coordination.
+
+    ``per_rank_engine`` means that every distributed rank owns an independent
+    scheduler. ``scheduler_aggregates_worker_output`` means that one scheduler
+    receives and combines connector metadata from all of its workers.
+    """
+
+    per_rank_engine: bool
+    scheduler_aggregates_worker_output: bool
+
+
+def _executor_topology(vllm_config: "VllmConfig") -> _ExecutorTopology:
+    """Resolve the coordination properties needed by the offload layout."""
+    from vllm.v1.executor.abstract import Executor
+    from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+    from vllm.v1.executor.ray_executor import RayDistributedExecutor
+    from vllm.v1.executor.uniproc_executor import ExecutorWithExternalLauncher
+
+    executor_class = Executor.get_class(vllm_config)
+    return _ExecutorTopology(
+        per_rank_engine=issubclass(executor_class, ExecutorWithExternalLauncher),
+        scheduler_aggregates_worker_output=issubclass(
+            executor_class, (MultiprocExecutor, RayDistributedExecutor)
+        ),
+    )
 
 
 def get_offloading_group_ids(kv_cache_config: "KVCacheConfig") -> tuple[int, ...]:
@@ -68,14 +96,18 @@ def build_offloading_config(
     engine_id = kv_transfer_config.engine_id
 
     parallel_config = vllm_config.parallel_config
-    if (
-        parallel_config.distributed_executor_backend == "external_launcher"
-        and parallel_config.data_parallel_size > 1
-    ):
+    topology = _executor_topology(vllm_config)
+    per_rank_engine = topology.per_rank_engine
+    if per_rank_engine and parallel_config.data_parallel_size > 1:
         # Each external-launcher process owns one DP engine.  TP ranks within
         # that engine must share a region, while different DP engines need
         # separate regions even when they receive the same base engine_id.
         engine_id = f"{engine_id}_dp{parallel_config.data_parallel_index}"
+    engine_world_size = (
+        parallel_config.tensor_parallel_size
+        * parallel_config.pipeline_parallel_size
+        * parallel_config.prefill_context_parallel_size
+    )
     selected_groups = tuple(
         (group_id, kv_cache_config.kv_cache_groups[group_id])
         for group_id in get_offloading_group_ids(kv_cache_config)
@@ -163,6 +195,12 @@ def build_offloading_config(
         if len(kv_cache_config.kv_cache_groups) == 1
         else None
     )
+    # Aggregating executors use an engine-local worker world. External
+    # launchers include all DP engines in world_size and use the per-rank path.
+    scheduler_world_is_engine_local = parallel_config.world_size == engine_world_size
+    shared_region_executor_supported = per_rank_engine or (
+        topology.scheduler_aggregates_worker_output and scheduler_world_is_engine_local
+    )
     replicated_layout = (
         vllm_config.model_config.use_mla
         and parallel_config.tensor_parallel_size > 1
@@ -172,9 +210,7 @@ def build_offloading_config(
         and parallel_config.pipeline_parallel_size == 1
         and parallel_config.prefill_context_parallel_size == 1
         and parallel_config.decode_context_parallel_size == 1
-        and parallel_config.world_size == parallel_config.tensor_parallel_size
-        # Shared /dev/shm mmap layout is single-node mp only.
-        and parallel_config.distributed_executor_backend == "mp"
+        and shared_region_executor_supported
         and parallel_config.nnodes_within_dp == 1
     )
 
@@ -184,7 +220,7 @@ def build_offloading_config(
     # pages is parallelism-invariant: replicated latent or GQA heads,
     # per-token-head scales, CP token sharding, and the V2 model runner's
     # layout are all excluded.
-    is_parallelism_agnostic = (
+    direct_layout_is_parallelism_agnostic = (
         not vllm_config.use_v2_model_runner
         and single_group_spec is not None
         and isinstance(single_group_spec, FullAttentionSpec)
@@ -195,10 +231,11 @@ def build_offloading_config(
         and parallel_config.decode_context_parallel_size == 1
         and parallel_config.prefill_context_parallel_size == 1
     )
+    canonical_layout_is_parallelism_agnostic = False
     # Canonical pages are topology-free, so the gate widens to every config
     # whose mappings derive portable, group by group; certification happens
     # per layer at registration and create_worker fails closed on this flag.
-    if canonical_layout and not is_parallelism_agnostic:
+    if canonical_layout and not direct_layout_is_parallelism_agnostic:
         tp_size = parallel_config.tensor_parallel_size
         total_kv_heads = vllm_config.model_config.get_total_num_kv_heads()
 
@@ -228,13 +265,19 @@ def build_offloading_config(
             for group in kv_cache_config.kv_cache_groups
             for spec in iter_layer_specs(group.kv_cache_spec)
         ]
-        is_parallelism_agnostic = (
+        canonical_layout_is_parallelism_agnostic = (
             len(layer_specs) > 0
             and all(spec_certifiable(spec) for spec in layer_specs)
             and parallel_config.decode_context_parallel_size == 1
             and parallel_config.prefill_context_parallel_size == 1
-            and parallel_config.world_size == tp_size
+            and engine_world_size == tp_size
+            and (engine_world_size == 1 or shared_region_executor_supported)
         )
+
+    is_parallelism_agnostic = (
+        direct_layout_is_parallelism_agnostic
+        or canonical_layout_is_parallelism_agnostic
+    )
 
     if canonical_layout:
         replicated_layout = (
@@ -245,10 +288,6 @@ def build_offloading_config(
                 for spec in iter_layer_specs(group.kv_cache_spec)
             )
             and parallel_config.nnodes_within_dp == 1
-            and (
-                parallel_config.world_size == 1
-                or parallel_config.distributed_executor_backend == "mp"
-            )
         )
 
     kv_events_config = vllm_config.kv_events_config
@@ -285,9 +324,8 @@ def build_offloading_config(
             data_parallel_size=parallel_config.data_parallel_size,
             data_parallel_rank_local=parallel_config.data_parallel_rank_local,
             is_parallelism_agnostic=is_parallelism_agnostic,
-            per_rank_engine=(
-                parallel_config.distributed_executor_backend == "external_launcher"
-            ),
+            per_rank_engine=per_rank_engine,
+            engine_world_size=engine_world_size,
         ),
         replicated_layout=replicated_layout,
         canonical_layout=canonical_layout,

@@ -23,12 +23,23 @@ from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
 
-def _shared_region_barrier() -> None:
-    """Synchronize all ranks that may open the shared mmap region."""
+def _shared_region_barrier(per_rank_engine: bool = False) -> None:
+    """Synchronize ranks that may open the same shared mmap region.
+
+    A per-rank engine has one scheduler per TP group, so using the global
+    world group would couple otherwise independent DP engines. The fallback
+    groups preserve the existing MP/Ray behavior.
+    """
     from vllm.distributed.parallel_state import (
         get_inner_dp_world_group,
         get_world_group,
     )
+
+    if per_rank_engine:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        get_tp_group().barrier()
+        return
 
     try:
         group = get_inner_dp_world_group()
@@ -96,7 +107,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 "cpu_bytes_to_use must be specified in kv_connector_extra_config"
             )
 
-        world_size = config.parallel.world_size
+        world_size = config.parallel.engine_world_size
         self.num_chunks = 0
         self.kv_bytes_per_chunk = 0
         self.cpu_page_size_per_worker = 0
@@ -167,15 +178,7 @@ class CPUOffloadingSpec(OffloadingSpec):
         """Return this worker's rank within its local engine topology."""
         worker_world_size = self.config.parallel.world_size
         if self.config.parallel.per_rank_engine:
-            # external_launcher includes all DP engines in world_size, but
-            # each mmap path belongs to one DP engine. Use the topology of
-            # one engine because independent DP setup may reset
-            # data_parallel_size to one before this spec is built.
-            worker_world_size = (
-                self.config.parallel.tp_size
-                * self.config.parallel.pp_size
-                * self.config.parallel.pcp_size
-            )
+            worker_world_size = self.config.parallel.engine_world_size
         from vllm.distributed.parallel_state import get_world_group
 
         return get_world_group().local_rank % worker_world_size
@@ -198,7 +201,9 @@ class CPUOffloadingSpec(OffloadingSpec):
                 rank=rank,
                 kv_bytes_per_chunk=self.kv_bytes_per_chunk,
                 cpu_page_size=self.cpu_page_size_per_worker,
-                barrier=_shared_region_barrier,
+                barrier=lambda: _shared_region_barrier(
+                    self.config.parallel.per_rank_engine is True
+                ),
                 unlink_owner=worker_rank == 0,
             )
         try:

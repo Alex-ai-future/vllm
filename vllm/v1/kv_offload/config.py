@@ -60,6 +60,8 @@ class OffloadingParallelConfig:
     # under any topology; for the canonical layout, the canonical page itself
     # is topology-free.
     is_parallelism_agnostic: bool
+    # Number of workers within this DP replica's engine topology.
+    engine_world_size: int
     # True when each rank runs its own engine (torchrun-style launch) rather
     # than one engine driving the workers over RPC.
     per_rank_engine: bool = False

@@ -21,6 +21,7 @@ from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
     kv_cache_groups_tp_replicas,
 )
+from vllm.v1.executor.abstract import Executor
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
@@ -311,6 +312,7 @@ def _replicated_layout(
     use_v2_model_runner: bool = False,
     distributed_executor_backend: Any = "mp",
     nnodes: int = 1,
+    data_parallel_size: int = 1,
     world_size: int | None = None,
 ) -> bool:
     config = _make_vllm_config(
@@ -323,8 +325,11 @@ def _replicated_layout(
     config.use_v2_model_runner = use_v2_model_runner
     config.parallel_config.distributed_executor_backend = distributed_executor_backend
     config.parallel_config.nnodes = nnodes
+    config.parallel_config.data_parallel_size = data_parallel_size
     if world_size is not None:
         config.parallel_config.world_size = world_size
+    elif distributed_executor_backend == "external_launcher":
+        config.parallel_config.world_size *= data_parallel_size
     kv_cache_config.kv_tp_replicas = kv_cache_groups_tp_replicas(
         kv_cache_config.kv_cache_groups,
         config.parallel_config.tensor_parallel_size,
@@ -1094,9 +1099,8 @@ def test_replicated_layout_for_dsa_style_groups(
         ({"prefill_context_parallel_size": 2, "world_size": 4}, "pcp2"),
         ({"decode_context_parallel_size": 2}, "dcp2"),
         ({"world_size": 8}, "world-ne-tp"),
-        ({"distributed_executor_backend": "ray"}, "ray"),
         ({"distributed_executor_backend": "uni"}, "uni"),
-        ({"distributed_executor_backend": type("DummyExecutor", (), {})}, "class"),
+        ({"distributed_executor_backend": Executor}, "class"),
         ({"nnodes": 2}, "multi-node"),
     ],
     ids=[
@@ -1106,7 +1110,6 @@ def test_replicated_layout_for_dsa_style_groups(
         "pcp2",
         "dcp2",
         "world-ne-tp",
-        "ray",
         "uni",
         "class",
         "multi-node",
@@ -1114,6 +1117,94 @@ def test_replicated_layout_for_dsa_style_groups(
 )
 def test_replicated_layout_parallel_gate(kwargs: dict[str, Any], case: str):
     assert not _replicated_layout(_make_mla_kv_cache_config(), **kwargs), case
+
+
+def test_replicated_layout_enabled_for_ray_single_node():
+    assert _replicated_layout(
+        _make_mla_kv_cache_config(),
+        tensor_parallel_size=2,
+        distributed_executor_backend="ray",
+    )
+
+
+def test_replicated_layout_enabled_for_external_launcher_dp():
+    assert _replicated_layout(
+        _make_mla_kv_cache_config(),
+        tensor_parallel_size=2,
+        distributed_executor_backend="external_launcher",
+        data_parallel_size=2,
+    )
+
+
+def test_replicated_layout_uses_executor_topology_types():
+    from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+    from vllm.v1.executor.uniproc_executor import ExecutorWithExternalLauncher
+
+    class PerRankExecutor(ExecutorWithExternalLauncher):
+        pass
+
+    class AggregatingExecutor(MultiprocExecutor):
+        pass
+
+    assert _replicated_layout(
+        _make_mla_kv_cache_config(),
+        tensor_parallel_size=2,
+        distributed_executor_backend=PerRankExecutor,
+        data_parallel_size=2,
+    )
+    assert _replicated_layout(
+        _make_mla_kv_cache_config(),
+        tensor_parallel_size=2,
+        distributed_executor_backend=AggregatingExecutor,
+    )
+
+
+def test_external_replicated_scheduler_uses_engine_local_worker_count():
+    config = _make_vllm_config(tensor_parallel_size=2)
+    config.model_config.use_mla = True
+    config.parallel_config.distributed_executor_backend = "external_launcher"
+    config.parallel_config.data_parallel_size = 2
+    config.parallel_config.world_size = 4
+    kv_cache_config = _make_mla_kv_cache_config()
+    kv_cache_config.kv_tp_replicas = 2
+    offloading_config = build_offloading_config(config, kv_cache_config)
+    spec = MockOffloadingSpec(offloading_config)
+    spec.replicated_layout = offloading_config.replicated_layout
+
+    scheduler_config = SchedulerOffloadConfig.from_spec(spec, config, kv_cache_config)
+
+    assert spec.replicated_layout
+    assert scheduler_config.num_workers == 1
+
+
+@pytest.mark.parametrize("backend", ["mp", "external_launcher"])
+@pytest.mark.parametrize("tp,pp,pcp", [(2, 1, 1), (2, 2, 2)])
+def test_offloading_rank_and_size_belong_to_one_dp_replica(backend, tp, pp, pcp):
+    config = _make_vllm_config(
+        tensor_parallel_size=tp,
+        pipeline_parallel_size=pp,
+        prefill_context_parallel_size=pcp,
+    )
+    engine_size = tp * pp * pcp
+    config.parallel_config.distributed_executor_backend = backend
+    config.parallel_config.data_parallel_size = 2
+    config.parallel_config.data_parallel_index = 1
+    config.parallel_config.world_size = (
+        2 * engine_size if backend == "external_launcher" else engine_size
+    )
+    config.parallel_config.rank = (
+        engine_size + 1 if backend == "external_launcher" else 1
+    )
+
+    parallel = build_offloading_config(config, _make_kv_cache_config()).parallel
+
+    expected_rank = engine_size + 1 if backend == "external_launcher" else 1
+    expected_world_size = (
+        2 * engine_size if backend == "external_launcher" else engine_size
+    )
+    assert parallel.rank == expected_rank
+    assert parallel.world_size == expected_world_size
+    assert parallel.engine_world_size == engine_size
 
 
 def test_parallelism_agnostic_for_single_full_attention_group():

@@ -332,7 +332,11 @@ class SchedulerOffloadConfig(NamedTuple):
                     )
 
         return cls(
-            num_workers=vllm_config.parallel_config.world_size,
+            num_workers=(
+                1
+                if (spec.replicated_layout and spec.config.parallel.per_rank_engine)
+                else vllm_config.parallel_config.world_size
+            ),
             kv_group_configs=kv_group_configs,
             blocks_per_chunk=spec.blocks_per_chunk,
             tokens_per_hash=spec.tokens_per_hash,

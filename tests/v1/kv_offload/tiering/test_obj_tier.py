@@ -76,6 +76,7 @@ def _make_offloading_config(
             data_parallel_size=1,
             data_parallel_rank_local=None,
             is_parallelism_agnostic=is_parallelism_agnostic,
+            engine_world_size=tp_size,
         ),
         replicated_layout=replicated_layout,
     )

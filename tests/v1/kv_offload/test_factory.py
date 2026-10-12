@@ -101,6 +101,9 @@ def _make_offloading_config(
             data_parallel_size=data_parallel_size,
             data_parallel_rank_local=data_parallel_rank_local,
             is_parallelism_agnostic=is_parallelism_agnostic,
+            engine_world_size=(tp_size if tp_size is not None else world_size)
+            * pp_size
+            * pcp_size,
             per_rank_engine=per_rank_engine,
         ),
         replicated_layout=replicated_layout,
@@ -269,6 +272,7 @@ def test_tiering_spec_create_worker_uses_logical_rank_for_sharded_layout(monkeyp
         spec_name="TieringOffloadingSpec",
         worker_kv_bytes_per_block=4096,
         world_size=4,
+        rank=1,
     )
     assert isinstance(spec, TieringOffloadingSpec)
 
@@ -351,9 +355,21 @@ def test_tiering_spec_scheduler_region_uses_startup_barrier(monkeypatch):
 
     spec.get_manager()
 
-    assert region_calls[0]["barrier"] is barrier
-    barrier.assert_called_once_with()
+    assert callable(region_calls[0]["barrier"])
+    barrier.assert_called_once_with(True)
     region.unlink.assert_called_once_with()
+
+
+def test_per_rank_shared_region_barrier_uses_tp_group(monkeypatch):
+    import vllm.distributed.parallel_state as parallel_state
+    import vllm.v1.kv_offload.cpu.spec as cpu_spec_module
+
+    tp_group = SimpleNamespace(barrier=MagicMock())
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp_group)
+
+    cpu_spec_module._shared_region_barrier(per_rank_engine=True)
+
+    tp_group.barrier.assert_called_once_with()
 
 
 @pytest.mark.parametrize("world_size", [2, 4, 8])
@@ -618,6 +634,7 @@ def test_cpu_spec_create_worker_rank_assignment(
         world_size=world_size,
         tp_size=tp_size,
         data_parallel_size=data_parallel_size,
+        rank=local_rank,
         per_rank_engine=per_rank_engine,
         replicated_layout=replicated_layout,
     )
