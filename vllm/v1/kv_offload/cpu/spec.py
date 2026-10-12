@@ -107,7 +107,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 "cpu_bytes_to_use must be specified in kv_connector_extra_config"
             )
 
-        world_size = config.parallel.world_size
+        world_size = config.parallel.engine_world_size
         self.num_chunks = 0
         self.kv_bytes_per_chunk = 0
         self.cpu_page_size_per_worker = 0
@@ -176,20 +176,7 @@ class CPUOffloadingSpec(OffloadingSpec):
     @property
     def worker_rank(self) -> int:
         """Return this worker's rank within its local engine topology."""
-        worker_world_size = self.config.parallel.world_size
-        if self.config.parallel.per_rank_engine:
-            # external_launcher includes all DP engines in world_size, but
-            # each mmap path belongs to one DP engine. Use the topology of
-            # one engine because independent DP setup may reset
-            # data_parallel_size to one before this spec is built.
-            worker_world_size = (
-                self.config.parallel.tp_size
-                * self.config.parallel.pp_size
-                * self.config.parallel.pcp_size
-            )
-        from vllm.distributed.parallel_state import get_world_group
-
-        return get_world_group().local_rank % worker_world_size
+        return self.config.parallel.engine_rank
 
     def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
         mmap_region: SharedOffloadRegion | None = None

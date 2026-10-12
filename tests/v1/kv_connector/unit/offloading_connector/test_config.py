@@ -21,6 +21,7 @@ from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
     kv_cache_groups_tp_replicas,
 )
+from vllm.v1.executor.abstract import Executor
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
@@ -1099,7 +1100,7 @@ def test_replicated_layout_for_dsa_style_groups(
         ({"decode_context_parallel_size": 2}, "dcp2"),
         ({"world_size": 8}, "world-ne-tp"),
         ({"distributed_executor_backend": "uni"}, "uni"),
-        ({"distributed_executor_backend": type("DummyExecutor", (), {})}, "class"),
+        ({"distributed_executor_backend": Executor}, "class"),
         ({"nnodes": 2}, "multi-node"),
     ],
     ids=[
@@ -1174,6 +1175,37 @@ def test_external_replicated_scheduler_uses_engine_local_worker_count():
 
     assert spec.replicated_layout
     assert scheduler_config.num_workers == 1
+
+
+@pytest.mark.parametrize("backend", ["mp", "external_launcher"])
+@pytest.mark.parametrize("tp,pp,pcp", [(2, 1, 1), (2, 2, 2)])
+def test_offloading_rank_and_size_belong_to_one_dp_replica(backend, tp, pp, pcp):
+    config = _make_vllm_config(
+        tensor_parallel_size=tp,
+        pipeline_parallel_size=pp,
+        prefill_context_parallel_size=pcp,
+    )
+    engine_size = tp * pp * pcp
+    config.parallel_config.distributed_executor_backend = backend
+    config.parallel_config.data_parallel_size = 2
+    config.parallel_config.data_parallel_index = 1
+    config.parallel_config.world_size = (
+        2 * engine_size if backend == "external_launcher" else engine_size
+    )
+    config.parallel_config.rank = (
+        engine_size + 1 if backend == "external_launcher" else 1
+    )
+
+    parallel = build_offloading_config(config, _make_kv_cache_config()).parallel
+
+    expected_rank = engine_size + 1 if backend == "external_launcher" else 1
+    expected_world_size = (
+        2 * engine_size if backend == "external_launcher" else engine_size
+    )
+    assert parallel.rank == expected_rank
+    assert parallel.world_size == expected_world_size
+    assert parallel.engine_rank == 1
+    assert parallel.engine_world_size == engine_size
 
 
 def test_parallelism_agnostic_for_single_full_attention_group():

@@ -101,6 +101,10 @@ def _make_offloading_config(
             data_parallel_size=data_parallel_size,
             data_parallel_rank_local=data_parallel_rank_local,
             is_parallelism_agnostic=is_parallelism_agnostic,
+            engine_rank=rank % (tp_size if tp_size is not None else world_size),
+            engine_world_size=(tp_size if tp_size is not None else world_size)
+            * pp_size
+            * pcp_size,
             per_rank_engine=per_rank_engine,
         ),
         replicated_layout=replicated_layout,
@@ -269,6 +273,7 @@ def test_tiering_spec_create_worker_uses_logical_rank_for_sharded_layout(monkeyp
         spec_name="TieringOffloadingSpec",
         worker_kv_bytes_per_block=4096,
         world_size=4,
+        rank=1,
     )
     assert isinstance(spec, TieringOffloadingSpec)
 
@@ -630,6 +635,7 @@ def test_cpu_spec_create_worker_rank_assignment(
         world_size=world_size,
         tp_size=tp_size,
         data_parallel_size=data_parallel_size,
+        rank=local_rank,
         per_rank_engine=per_rank_engine,
         replicated_layout=replicated_layout,
     )

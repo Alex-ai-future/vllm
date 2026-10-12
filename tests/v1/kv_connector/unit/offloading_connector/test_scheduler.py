@@ -113,6 +113,7 @@ def test_swa_offload_window_covers_unaligned_hit(
         )
     manager = CPUOffloadingManager(num_chunks=100)
     spec = SimpleNamespace(
+        replicated_layout=False,
         config=SimpleNamespace(
             groups=tuple(
                 SimpleNamespace(

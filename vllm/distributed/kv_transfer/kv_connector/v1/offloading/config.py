@@ -52,10 +52,7 @@ def _executor_topology(vllm_config: "VllmConfig") -> _ExecutorTopology:
     from vllm.v1.executor.ray_executor import RayDistributedExecutor
     from vllm.v1.executor.uniproc_executor import ExecutorWithExternalLauncher
 
-    backend = vllm_config.parallel_config.distributed_executor_backend
-    executor_class = (
-        backend if isinstance(backend, type) else Executor.get_class(vllm_config)
-    )
+    executor_class = Executor.get_class(vllm_config)
     return _ExecutorTopology(
         per_rank_engine=issubclass(executor_class, ExecutorWithExternalLauncher),
         scheduler_aggregates_worker_output=issubclass(
@@ -106,8 +103,6 @@ def build_offloading_config(
         # that engine must share a region, while different DP engines need
         # separate regions even when they receive the same base engine_id.
         engine_id = f"{engine_id}_dp{parallel_config.data_parallel_index}"
-    # Per-rank launchers may include all DP engines in world_size. The mmap
-    # region belongs to one engine, whose local topology is TP x PP x PCP.
     engine_world_size = (
         parallel_config.tensor_parallel_size
         * parallel_config.pipeline_parallel_size
@@ -331,14 +326,8 @@ def build_offloading_config(
             blocks_per_chunk=blocks_per_chunk,
         ),
         parallel=OffloadingParallelConfig(
-            rank=(
-                parallel_config.rank % engine_world_size
-                if per_rank_engine
-                else parallel_config.rank
-            ),
-            world_size=(
-                engine_world_size if per_rank_engine else parallel_config.world_size
-            ),
+            rank=parallel_config.rank,
+            world_size=parallel_config.world_size,
             tp_size=parallel_config.tensor_parallel_size,
             pp_size=parallel_config.pipeline_parallel_size,
             pcp_size=parallel_config.prefill_context_parallel_size,
@@ -348,6 +337,8 @@ def build_offloading_config(
             data_parallel_rank_local=parallel_config.data_parallel_rank_local,
             is_parallelism_agnostic=is_parallelism_agnostic,
             per_rank_engine=per_rank_engine,
+            engine_rank=parallel_config.rank % engine_world_size,
+            engine_world_size=engine_world_size,
         ),
         replicated_layout=replicated_layout,
         canonical_layout=canonical_layout,

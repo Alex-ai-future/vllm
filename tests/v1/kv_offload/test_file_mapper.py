@@ -55,6 +55,17 @@ def make_mapper_from_offloading_spec(**kwargs) -> FileMapper:
             data_parallel_size=1,
             data_parallel_rank_local=None,
             is_parallelism_agnostic=kwargs.get("is_parallelism_agnostic", False),
+            engine_rank=kwargs.get("rank", 0)
+            % (
+                kwargs.get("tp_size", 1)
+                * kwargs.get("pp_size", 1)
+                * kwargs.get("pcp_size", 1)
+            ),
+            engine_world_size=(
+                kwargs.get("tp_size", 1)
+                * kwargs.get("pp_size", 1)
+                * kwargs.get("pcp_size", 1)
+            ),
         ),
         replicated_layout=kwargs.get("replicated_layout", False),
         canonical_layout=kwargs.get("canonical_layout", False),

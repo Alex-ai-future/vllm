@@ -51,19 +51,11 @@ class OffloadingConnectorWorker:
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.worker: OffloadingWorker | None = None
-        parallel_config = getattr(self.spec.config, "parallel", None)
-        # Per-rank replicated mode gives every independent scheduler its own
-        # byte-identical copy. A shared scheduler only needs rank 0 to write.
-        self._per_rank_replicated = (
-            getattr(parallel_config, "per_rank_engine", False) is True
-            and self.spec.replicated_layout
-            and getattr(self.spec.config, "canonical_layout", False) is False
-        )
         self._is_store_writer = (
             not self.spec.replicated_layout
             or self.spec.config.canonical_layout
-            or getattr(parallel_config, "rank", 0) == 0
-            or self._per_rank_replicated
+            or self.spec.config.parallel.rank == 0
+            or self.spec.config.parallel.per_rank_engine
         )
 
         # job_id -> req_id for in-flight loads.

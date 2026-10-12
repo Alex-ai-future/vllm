@@ -331,13 +331,10 @@ class SchedulerOffloadConfig(NamedTuple):
                         f"tokens_per_chunk ({config.tokens_per_chunk})."
                     )
 
-        parallel_config = getattr(spec.config, "parallel", None)
-        per_rank_engine = getattr(parallel_config, "per_rank_engine", False)
-
         return cls(
             num_workers=(
                 1
-                if (per_rank_engine and spec.replicated_layout)
+                if (spec.replicated_layout and spec.config.parallel.per_rank_engine)
                 else vllm_config.parallel_config.world_size
             ),
             kv_group_configs=kv_group_configs,
