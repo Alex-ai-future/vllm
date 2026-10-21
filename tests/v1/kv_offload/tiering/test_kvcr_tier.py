@@ -421,13 +421,11 @@ def test_kvcr_tier_maps_query_status(monkeypatch, status, expected):
 
 
 def test_kvcr_tier_serves_primary_pin_request(monkeypatch):
-    """Hold primary-tier hits until KVCR releases the corresponding pin."""
+    """Hold primary-tier hits without promoting unusable secondary hits."""
     kvcr = RecordingKVCR()
     tier = _make_tier(monkeypatch, kvcr)
     keys = (BlockKey(b"k0"), BlockKey(b"k1"), BlockKey(b"k2"))
     hit_keys = (keys[0], keys[2])
-    # k1 lives only in a secondary tier, so the pin probe must not promote it
-    # until the primary HITs are pinned, and must still promote it afterwards.
     secondary_keys = (keys[1],)
     chunk_ids = {keys[0]: 1, keys[2]: 3}
     lifecycle: list[str] = []
@@ -435,7 +433,6 @@ def test_kvcr_tier_serves_primary_pin_request(monkeypatch):
     class Parent:
         def __init__(self) -> None:
             self.calls: list[str] = []
-            self.promoted: list[OffloadKey] = []
 
         def on_new_request(self, req_context):
             lifecycle.append("new")
@@ -458,16 +455,8 @@ def test_kvcr_tier_serves_primary_pin_request(monkeypatch):
             ]
 
         def promote_batch(self, probes, req_context):
-            requested = list(probes)
             self.calls.append("promote")
-            self.promoted.extend(
-                probe.key for probe in requested if probe.promotion_tier is not None
-            )
-            return {
-                probe.key: LookupResult.HIT_PENDING
-                for probe in requested
-                if probe.promotion_tier is not None
-            }
+            raise AssertionError("KVCR pin must not promote")
 
         def create_store_job(self, requested_keys, req_context):
             self.calls.append("create_store_job")
@@ -489,8 +478,7 @@ def test_kvcr_tier_serves_primary_pin_request(monkeypatch):
 
     parent = Parent()
     tier.serve_external_requests(parent)
-    assert parent.calls == ["new", "probe", "create_store_job", "promote", "finished"]
-    assert parent.promoted == [keys[1]]
+    assert parent.calls == ["new", "probe", "create_store_job", "finished"]
 
     [(queued_request, result)] = bindings.poll_pin_results()
     assert queued_request == request
@@ -518,12 +506,8 @@ def test_kvcr_tier_serves_primary_pin_request(monkeypatch):
     assert list(tier.get_finished_jobs()) == [JobResult(11, True)]
 
 
-def test_kvcr_tier_promotes_secondary_hits_without_pinning(monkeypatch):
-    """A pin request with no primary HIT still starts its promotions.
-
-    The old per-key lookup() promoted a secondary HIT even when this round
-    could pin nothing; the batch path must keep that side effect.
-    """
+def test_kvcr_tier_does_not_promote_secondary_hits_without_pinning(monkeypatch):
+    """A pin request with no primary HIT does not start promotions."""
     kvcr = RecordingKVCR()
     tier = _make_tier(monkeypatch, kvcr)
     keys = (BlockKey(b"k0"), BlockKey(b"k1"))
@@ -531,7 +515,6 @@ def test_kvcr_tier_promotes_secondary_hits_without_pinning(monkeypatch):
     class Parent:
         def __init__(self) -> None:
             self.calls: list[str] = []
-            self.promoted: list[OffloadKey] = []
 
         def on_new_request(self, req_context):
             self.calls.append("new")
@@ -546,14 +529,7 @@ def test_kvcr_tier_promotes_secondary_hits_without_pinning(monkeypatch):
 
         def promote_batch(self, probes, req_context):
             self.calls.append("promote")
-            self.promoted.extend(
-                probe.key for probe in probes if probe.promotion_tier is not None
-            )
-            return {
-                probe.key: LookupResult.HIT_PENDING
-                for probe in probes
-                if probe.promotion_tier is not None
-            }
+            raise AssertionError("KVCR pin must not promote")
 
         def create_store_job(self, requested_keys, req_context):
             raise AssertionError("no key can be pinned")
@@ -568,8 +544,7 @@ def test_kvcr_tier_promotes_secondary_hits_without_pinning(monkeypatch):
     parent = Parent()
     tier.serve_external_requests(parent)
 
-    assert parent.calls == ["new", "probe", "promote", "finished"]
-    assert parent.promoted == list(keys)
+    assert parent.calls == ["new", "probe", "finished"]
 
     [(queued_request, result)] = bindings.poll_pin_results()
     assert queued_request == request
