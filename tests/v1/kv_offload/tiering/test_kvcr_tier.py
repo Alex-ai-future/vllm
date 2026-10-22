@@ -447,7 +447,8 @@ def test_kvcr_tier_serves_primary_pin_request(monkeypatch):
         def lookup(self, key, req_context):
             return LookupResult.HIT if key in hit_keys else LookupResult.MISS
 
-        def probe_batch(self, requested_keys, req_context):
+        def probe_batch(self, requested_keys, req_context, *, include_secondary=True):
+            assert not include_secondary
             self.calls.append("probe")
             return [
                 LookupProbe(key, None, 0)
@@ -528,7 +529,8 @@ def test_kvcr_tier_does_not_promote_secondary_hits_without_pinning(monkeypatch):
         def lookup(self, key, req_context):
             return LookupResult.MISS
 
-        def probe_batch(self, requested_keys, req_context):
+        def probe_batch(self, requested_keys, req_context, *, include_secondary=True):
+            assert not include_secondary
             self.calls.append("probe")
             return [LookupProbe(key, None, 0) for key in requested_keys]
 

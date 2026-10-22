@@ -151,6 +151,8 @@ class ParentManager(ABC):
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
+        *,
+        include_secondary: bool = True,
     ) -> list[LookupProbe]:
         """Check ``keys`` without pinning anything or starting promotions.
 
@@ -158,7 +160,9 @@ class ParentManager(ABC):
         MISS are final; RETRY means a tier is still resolving the key and the
         caller must probe again; ``result is None`` means a secondary-tier HIT
         whose promotion must be requested via :meth:`promote_batch` after all
-        HITs are pinned.
+        HITs are pinned. Set ``include_secondary=False`` for callers that need
+        a primary descriptor in the current callback; results are then limited
+        to primary HIT, HIT_PENDING, and MISS, and ``promotion_tier`` is unset.
         """
 
     @abstractmethod

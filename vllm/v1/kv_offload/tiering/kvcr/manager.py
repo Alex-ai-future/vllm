@@ -190,9 +190,13 @@ class _FrameworkPinAdapter:
         try:
             parent.on_new_request(req_context)
             started = True
-            # lookup() would promote a secondary-tier HIT, but KVCR needs a
-            # descriptor before this synthetic request finishes.
-            probes = parent.probe_batch(offload_keys, req_context)
+            # KVCR needs a primary descriptor before this synthetic request
+            # finishes, so sibling tiers and their promotions are unusable.
+            probes = parent.probe_batch(
+                offload_keys,
+                req_context,
+                include_secondary=False,
+            )
             hit_keys = tuple(
                 probe.key for probe in probes if probe.result is LookupResult.HIT
             )
