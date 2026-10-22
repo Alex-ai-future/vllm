@@ -1872,6 +1872,19 @@ class TestProbeBatch:
         assert manager._pending_load_submissions == {}
         assert primary.lookup(key, ctx) is LookupResult.MISS
 
+    def test_probe_batch_can_skip_secondary_tiers(self, capacity_one):
+        manager, _, secondary, ctx = capacity_one
+        key = to_keys([7])[0]
+        secondary.chunks[key] = True
+        secondary_lookup = MagicMock(wraps=secondary.lookup)
+        secondary.lookup = secondary_lookup
+
+        assert manager.probe_batch([key], ctx, include_secondary=False) == [
+            LookupProbe(key, LookupResult.MISS)
+        ]
+        secondary_lookup.assert_not_called()
+        assert manager._pending_load_submissions == {}
+
     def test_probe_batch_of_no_keys_is_a_no_op(self, capacity_one):
         manager, _, _, ctx = capacity_one
         assert manager.probe_batch([], ctx) == []

@@ -193,9 +193,18 @@ class _SecondaryTierFacingParent(ParentManager):
         return self._m.lookup(key, req_context, exclude_tier_idx=self._origin_idx)
 
     def probe_batch(
-        self, keys: Collection[OffloadKey], req_context: ReqContext
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+        *,
+        include_secondary: bool = True,
     ) -> list[LookupProbe]:
-        return self._m.probe_batch(keys, req_context, exclude_tier_idx=self._origin_idx)
+        return self._m.probe_batch(
+            keys,
+            req_context,
+            exclude_tier_idx=self._origin_idx,
+            include_secondary=include_secondary,
+        )
 
     def promote_batch(
         self, probes: Collection[LookupProbe], req_context: ReqContext
@@ -642,12 +651,14 @@ class TieringOffloadingManager(OffloadingManager):
         req_context: ReqContext,
         *,
         exclude_tier_idx: int | None = None,
+        include_secondary: bool = True,
     ) -> LookupProbe:
-        """Query every tier for one key without pinning or promoting.
+        """Query one key without pinning or promoting.
 
         A secondary-tier HIT is reported as ``result=None`` plus the tier
         index so the caller can pin the batch's primary HITs before starting
-        any promotion.
+        any promotion. Secondary tiers are skipped when ``include_secondary``
+        is false.
         """
         start_time = time.monotonic()
         primary_hit = self.primary_tier.lookup(key, req_context)
@@ -663,6 +674,8 @@ class TieringOffloadingManager(OffloadingManager):
             return LookupProbe(key, LookupResult.HIT)
         if primary_hit is LookupResult.HIT_PENDING:
             return LookupProbe(key, LookupResult.HIT_PENDING)
+        if not include_secondary:
+            return LookupProbe(key, LookupResult.MISS)
 
         any_retry = False
         for i, tier in enumerate(self.secondary_tiers):
@@ -701,18 +714,26 @@ class TieringOffloadingManager(OffloadingManager):
         req_context: ReqContext,
         *,
         exclude_tier_idx: int | None = None,
+        include_secondary: bool = True,
     ) -> list[LookupProbe]:
         """Probe ``keys`` without pinning anything or starting promotions.
 
         Batch callers must pin every primary HIT with create_store_job()
         before calling promote_batch(): a promotion allocates primary-tier
-        space and may evict an unpinned HIT from this same batch.
+        space and may evict an unpinned HIT from this same batch. Set
+        ``include_secondary=False`` when only a primary descriptor can be used;
+        results are then limited to primary HIT, HIT_PENDING, and MISS.
         """
         if not keys:
             return []
         self._maybe_process_finished_jobs()
         return [
-            self._probe(key, req_context, exclude_tier_idx=exclude_tier_idx)
+            self._probe(
+                key,
+                req_context,
+                exclude_tier_idx=exclude_tier_idx,
+                include_secondary=include_secondary,
+            )
             for key in keys
         ]
 
