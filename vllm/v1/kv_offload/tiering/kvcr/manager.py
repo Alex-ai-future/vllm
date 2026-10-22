@@ -190,19 +190,14 @@ class _FrameworkPinAdapter:
         try:
             parent.on_new_request(req_context)
             started = True
-            # Probe the whole pin batch before touching primary capacity: a
-            # secondary-tier HIT starts a promotion, which may evict an
-            # earlier HIT of this batch before it is pinned.
+            # lookup() would promote a secondary-tier HIT, but KVCR needs a
+            # descriptor before this synthetic request finishes.
             probes = parent.probe_batch(offload_keys, req_context)
             hit_keys = tuple(
                 probe.key for probe in probes if probe.result is LookupResult.HIT
             )
             if hit_keys:
                 job = parent.create_store_job(hit_keys, req_context)
-            # Keep the old lookup() side effect: a secondary-tier HIT starts
-            # a promotion even when nothing could be pinned this round. It
-            # must run after create_store_job(), which pins this batch's HITs.
-            parent.promote_batch(probes, req_context)
             if not hit_keys:
                 return None
             assert job is not None
