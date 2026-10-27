@@ -101,10 +101,12 @@ class LookupProbe:
 
     ``result is None`` means the key is present in ``promotion_tier`` but has
     not been promoted yet. Promotion allocates primary-tier capacity and can
-    evict other probed keys, so it is deferred until every primary HIT in the
-    batch has been pinned. ``result is RETRY`` means at least one tier is
-    still resolving the key asynchronously; callers must probe again instead
-    of treating it as MISS.
+    evict other probed keys, so it is deferred until the batch's primary HITs
+    have been pinned for transfer. The manager also protects primary HITs it
+    has reported, so a caller cannot reintroduce the scheduler-path eviction
+    race by omitting that transfer pin. ``result is RETRY`` means at least one
+    tier is still resolving the key asynchronously; callers must probe again
+    instead of treating it as MISS.
     """
 
     key: OffloadKey
@@ -131,9 +133,10 @@ class ParentManager(ABC):
 
     ``lookup()`` remains the single-key entry point and keeps its old
     behavior (a secondary HIT starts a promotion immediately). Batch callers
-    that probe several keys must use ``probe_batch`` instead: ``lookup()``
-    promotes inline, and that promotion may evict an earlier HIT of the same
-    batch before it is pinned.
+    that probe several keys should still use ``probe_batch`` so they can pin
+    the primary HITs in one transfer and start at most one promotion per key.
+    A promotion cannot evict a HIT the manager already reported: the manager
+    pins those HITs before allocating primary-tier space for the promotion.
 
     Step 3 must complete for the whole batch before step 4 runs. Step 5 must
     be called even if no chunks were found, to avoid leaking async lookup
@@ -152,13 +155,15 @@ class ParentManager(ABC):
         keys: Collection[OffloadKey],
         req_context: ReqContext,
     ) -> list[LookupProbe]:
-        """Check ``keys`` without pinning anything or starting promotions.
+        """Check ``keys`` without starting promotions.
 
         Returns one :class:`LookupProbe` per key, in input order. HIT and
         MISS are final; RETRY means a tier is still resolving the key and the
         caller must probe again; ``result is None`` means a secondary-tier HIT
-        whose promotion must be requested via :meth:`promote_batch` after all
-        HITs are pinned.
+        whose promotion must be requested via :meth:`promote_batch`. A primary
+        HIT is registered for the manager's lookup-pin protection, but callers
+        that transfer it should still pin it in one batch with
+        :meth:`create_store_job` before promoting the rest of the batch.
         """
 
     @abstractmethod
@@ -169,7 +174,7 @@ class ParentManager(ABC):
     ) -> dict[OffloadKey, LookupResult]:
         """Start promotions for probes with ``result is None``.
 
-        Callers must pin every primary HIT of the same probe batch first.
+        Callers should pin every primary HIT of the same probe batch first.
         Returns the terminal lookup result per promoted key: HIT_PENDING when
         a promotion started, MISS when the primary tier could not make room.
         """

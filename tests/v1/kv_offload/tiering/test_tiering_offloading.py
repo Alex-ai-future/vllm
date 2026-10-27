@@ -1963,3 +1963,72 @@ class TestProbeBatch:
         assert results == {secondary_hit: LookupResult.MISS}
         # The promotion could not evict the pinned HIT, so it is still a HIT.
         assert primary.lookup(hit, ctx) is LookupResult.HIT
+
+    def test_lookup_protects_reported_hit_until_its_gpu_load_pins_it(
+        self, capacity_one
+    ):
+        """The scheduler's single-key lookup path must survive promotion.
+
+        ``_lookup_complete_chunks()`` reports a primary HIT, then
+        ``_lookup_partial_tail()`` can start a secondary promotion before
+        ``update_state_after_alloc()`` reaches prepare_load(). The promotion
+        must not evict the HIT that the scheduler already counted.
+        """
+        manager, primary, secondary, ctx = capacity_one
+        hit, secondary_hit = to_keys([1, 2])
+
+        manager.prepare_store([hit], ctx)
+        manager.complete_store([hit], ctx, success=True)
+        manager._process_finished_jobs()
+        secondary.chunks[secondary_hit] = True
+
+        assert manager.lookup(hit, ctx) is LookupResult.HIT
+        assert manager.lookup(secondary_hit, ctx) is LookupResult.MISS
+        assert primary.lookup(hit, ctx) is LookupResult.HIT
+
+        manager.prepare_load([hit], ctx)
+        # The lookup pin was handed over to the load pin, so the promotion
+        # still cannot use the only primary slot.
+        assert manager.lookup(secondary_hit, ctx) is LookupResult.MISS
+
+        manager.complete_load([hit], ctx)
+        # With both pins released, the secondary hit can now promote and evict
+        # the now-idle primary key.
+        assert manager.lookup(secondary_hit, ctx) is LookupResult.HIT_PENDING
+        assert primary.lookup(hit, ctx) is LookupResult.MISS
+
+    def test_on_schedule_end_releases_unconsumed_lookup_pins(self, capacity_one):
+        manager, primary, secondary, ctx = capacity_one
+        hit, secondary_hit = to_keys([1, 2])
+
+        manager.prepare_store([hit], ctx)
+        manager.complete_store([hit], ctx, success=True)
+        manager._process_finished_jobs()
+        secondary.chunks[secondary_hit] = True
+
+        assert manager.lookup(hit, ctx) is LookupResult.HIT
+        assert manager.lookup(secondary_hit, ctx) is LookupResult.MISS
+        manager.on_schedule_end(
+            ScheduleEndContext(new_req_ids=[], preempted_req_ids=())
+        )
+
+        assert manager.lookup(secondary_hit, ctx) is LookupResult.HIT_PENDING
+        assert primary.lookup(hit, ctx) is LookupResult.MISS
+
+    def test_on_request_finished_releases_unconsumed_lookup_pins(self, capacity_one):
+        manager, primary, secondary, ctx = capacity_one
+        hit, secondary_hit = to_keys([1, 2])
+
+        manager.prepare_store([hit], ctx)
+        manager.complete_store([hit], ctx, success=True)
+        manager._process_finished_jobs()
+        secondary.chunks[secondary_hit] = True
+
+        assert manager.lookup(hit, ctx) is LookupResult.HIT
+        assert manager.lookup(secondary_hit, ctx) is LookupResult.MISS
+        manager.on_request_finished(ctx)
+
+        next_ctx = ReqContext(req_id="next-request")
+        manager.on_new_request(next_ctx)
+        assert manager.lookup(secondary_hit, next_ctx) is LookupResult.HIT_PENDING
+        assert primary.lookup(hit, next_ctx) is LookupResult.MISS
