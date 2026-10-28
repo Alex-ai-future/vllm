@@ -5,7 +5,7 @@ import mmap
 from collections.abc import Collection, Iterable, Mapping
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import msgspec
 import numpy as np
@@ -41,9 +41,14 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.tiering.backpressure import EMABackpressureDetector
 from vllm.v1.kv_offload.tiering.base import JobResult, LookupProbe, TransferJob
+from vllm.v1.kv_offload.tiering.example.manager import ExampleSecondaryTierManager
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 from vllm.v1.kv_offload.tiering.kvcr import manager as kvcr_manager
 from vllm.v1.kv_offload.tiering.kvcr.manager import KVCRSecondaryTierManager
+from vllm.v1.kv_offload.tiering.manager import (
+    CPUPrimaryTierOffloadingManager,
+    TieringOffloadingManager,
+)
 
 
 def _op_entries(
@@ -421,13 +426,11 @@ def test_kvcr_tier_maps_query_status(monkeypatch, status, expected):
 
 
 def test_kvcr_tier_serves_primary_pin_request(monkeypatch):
-    """Hold primary-tier hits until KVCR releases the corresponding pin."""
+    """Hold primary-tier hits without promoting unusable secondary hits."""
     kvcr = RecordingKVCR()
     tier = _make_tier(monkeypatch, kvcr)
     keys = (BlockKey(b"k0"), BlockKey(b"k1"), BlockKey(b"k2"))
     hit_keys = (keys[0], keys[2])
-    # k1 lives only in a secondary tier, so the pin probe must not promote it
-    # until the primary HITs are pinned, and must still promote it afterwards.
     secondary_keys = (keys[1],)
     chunk_ids = {keys[0]: 1, keys[2]: 3}
     lifecycle: list[str] = []
@@ -435,7 +438,6 @@ def test_kvcr_tier_serves_primary_pin_request(monkeypatch):
     class Parent:
         def __init__(self) -> None:
             self.calls: list[str] = []
-            self.promoted: list[OffloadKey] = []
 
         def on_new_request(self, req_context):
             lifecycle.append("new")
@@ -458,16 +460,8 @@ def test_kvcr_tier_serves_primary_pin_request(monkeypatch):
             ]
 
         def promote_batch(self, probes, req_context):
-            requested = list(probes)
             self.calls.append("promote")
-            self.promoted.extend(
-                probe.key for probe in requested if probe.promotion_tier is not None
-            )
-            return {
-                probe.key: LookupResult.HIT_PENDING
-                for probe in requested
-                if probe.promotion_tier is not None
-            }
+            raise AssertionError("KVCR pin must not promote")
 
         def create_store_job(self, requested_keys, req_context):
             self.calls.append("create_store_job")
@@ -489,8 +483,7 @@ def test_kvcr_tier_serves_primary_pin_request(monkeypatch):
 
     parent = Parent()
     tier.serve_external_requests(parent)
-    assert parent.calls == ["new", "probe", "create_store_job", "promote", "finished"]
-    assert parent.promoted == [keys[1]]
+    assert parent.calls == ["new", "probe", "create_store_job", "finished"]
 
     [(queued_request, result)] = bindings.poll_pin_results()
     assert queued_request == request
@@ -518,12 +511,8 @@ def test_kvcr_tier_serves_primary_pin_request(monkeypatch):
     assert list(tier.get_finished_jobs()) == [JobResult(11, True)]
 
 
-def test_kvcr_tier_promotes_secondary_hits_without_pinning(monkeypatch):
-    """A pin request with no primary HIT still starts its promotions.
-
-    The old per-key lookup() promoted a secondary HIT even when this round
-    could pin nothing; the batch path must keep that side effect.
-    """
+def test_kvcr_tier_does_not_promote_secondary_hits_without_pinning(monkeypatch):
+    """A pin request with no primary HIT does not start promotions."""
     kvcr = RecordingKVCR()
     tier = _make_tier(monkeypatch, kvcr)
     keys = (BlockKey(b"k0"), BlockKey(b"k1"))
@@ -531,7 +520,6 @@ def test_kvcr_tier_promotes_secondary_hits_without_pinning(monkeypatch):
     class Parent:
         def __init__(self) -> None:
             self.calls: list[str] = []
-            self.promoted: list[OffloadKey] = []
 
         def on_new_request(self, req_context):
             self.calls.append("new")
@@ -546,14 +534,7 @@ def test_kvcr_tier_promotes_secondary_hits_without_pinning(monkeypatch):
 
         def promote_batch(self, probes, req_context):
             self.calls.append("promote")
-            self.promoted.extend(
-                probe.key for probe in probes if probe.promotion_tier is not None
-            )
-            return {
-                probe.key: LookupResult.HIT_PENDING
-                for probe in probes
-                if probe.promotion_tier is not None
-            }
+            raise AssertionError("KVCR pin must not promote")
 
         def create_store_job(self, requested_keys, req_context):
             raise AssertionError("no key can be pinned")
@@ -568,9 +549,62 @@ def test_kvcr_tier_promotes_secondary_hits_without_pinning(monkeypatch):
     parent = Parent()
     tier.serve_external_requests(parent)
 
-    assert parent.calls == ["new", "probe", "promote", "finished"]
-    assert parent.promoted == list(keys)
+    assert parent.calls == ["new", "probe", "finished"]
 
+    [(queued_request, result)] = bindings.poll_pin_results()
+    assert queued_request == request
+    assert result is None
+
+
+def test_kvcr_pin_does_not_touch_another_requests_pending_promotion(monkeypatch):
+    """A pending primary promotion remains pending and cannot satisfy this pin."""
+    kvcr = RecordingKVCR()
+    tier = _make_tier(monkeypatch, kvcr)
+    primary_view = memoryview(np.zeros((2, 16), dtype=np.int8))
+    region = MagicMock()
+    region.create_kv_memoryview.return_value = primary_view
+    primary = CPUPrimaryTierOffloadingManager(num_chunks=2, mmap_region=region)
+    secondary = ExampleSecondaryTierManager(
+        offloading_spec=MagicMock(),
+        primary_kv_view=primary_view,
+        tier_type="example",
+    )
+    manager = TieringOffloadingManager(primary, [secondary])
+    key = make_offload_key(b"pending", 0)
+    secondary.chunks[key] = True
+
+    primary.prepare_write = Mock(wraps=primary.prepare_write)
+    other_ctx = ReqContext(req_id="other")
+    manager.on_new_request(other_ctx)
+    assert manager.lookup(key, other_ctx) is LookupResult.HIT_PENDING
+    assert primary.prepare_write.call_count == 1
+    [(pending_for_req, pending_entry)] = [
+        (pending_for_req, pending_entry)
+        for pending_for_req in manager._pending_load_submissions.values()
+        for pending_entry in pending_for_req.values()
+    ]
+    original_keys = list(pending_entry.keys)
+
+    parent = SimpleNamespace(
+        on_new_request=manager.on_new_request,
+        probe_batch=manager.probe_batch,
+        promote_batch=manager.promote_batch,
+        create_store_job=manager.create_store_job,
+        on_request_finished=manager.on_request_finished,
+    )
+
+    bindings = kvcr.constructor_bindings
+    assert bindings is not None
+    request = bindings.request_pin([BlockKey(b"pending")])
+
+    tier.serve_external_requests(parent)
+
+    assert primary.prepare_write.call_count == 1
+    assert set(pending_for_req) == {other_ctx.req_id}
+    assert pending_for_req[other_ctx.req_id] is pending_entry
+    assert pending_entry.req_context is other_ctx
+    assert pending_entry.keys == original_keys
+    assert primary.lookup(key, other_ctx) is LookupResult.HIT_PENDING
     [(queued_request, result)] = bindings.poll_pin_results()
     assert queued_request == request
     assert result is None
