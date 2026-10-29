@@ -436,6 +436,32 @@ class TestTieringOffloadingManager:
         # Chunks should be in primary tier
         assert count_hits(self.primary_tier, chunks) == 3
 
+    def test_store_phase_polls_secondary_tiers_once_per_step(
+        self, manager_setup, monkeypatch
+    ):
+        """prepare_store() runs once per storing request, all within one store
+        phase, so polling per call would sweep every secondary tier R times per
+        step. The first call's sweep covers the rest of the phase."""
+        tier1_jobs = MagicMock(wraps=self.secondary_tier1.get_finished_jobs)
+        tier2_jobs = MagicMock(wraps=self.secondary_tier2.get_finished_jobs)
+        monkeypatch.setattr(self.secondary_tier1, "get_finished_jobs", tier1_jobs)
+        monkeypatch.setattr(self.secondary_tier2, "get_finished_jobs", tier2_jobs)
+
+        for i in range(3):
+            ctx = ReqContext(req_id=f"req{i}")
+            self._start_request(ctx)
+            assert self.manager.prepare_store(to_keys([i]), ctx) is not None
+
+        tier1_jobs.assert_called_once_with()
+        tier2_jobs.assert_called_once_with()
+
+        # The next step polls again: the flag is reset with the step.
+        self._simulate_on_schedule_end()
+        ctx = ReqContext(req_id="req3")
+        self._start_request(ctx)
+        assert self.manager.prepare_store(to_keys([3]), ctx) is not None
+        assert tier1_jobs.call_count == 2
+
     def test_cascade_to_all_secondary_tiers(self, manager_setup, monkeypatch):
         """Test that chunks are cascaded to ALL secondary tiers."""
         chunks = to_keys(range(3))

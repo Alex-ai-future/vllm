@@ -331,6 +331,12 @@ class TieringOffloadingManager(OffloadingManager):
         # Reset at the end of each step in on_schedule_end().
         self._processed_jobs_this_step: bool = False
 
+        # prepare_store() runs once per storing request, all within one store
+        # phase of a step. Only the first call polls; the rest reuse it, so a
+        # step with R storing requests sweeps each secondary tier once instead
+        # of R times. Reset alongside the gate above.
+        self._store_phase_polled_this_step: bool = False
+
         # Per-request state for prepared GPU->primary stores and finalization.
         # Secondary tiers are finalized only after pending primary stores reach
         # complete_store(), since complete_store() can still submit cascades.
@@ -934,12 +940,15 @@ class TieringOffloadingManager(OffloadingManager):
         #    not-yet-ready chunk's ref_cnt from -1 to 0 via complete_write(),
         #    making it evictable for the first time.
         # Both must be accounted for before the eviction decision below.
-        # Unconditional, not _maybe_process_finished_jobs(): eviction must see
-        # the freshest completions, and on_schedule_end now runs at the very end
-        # of the step, so the once-per-step gate would otherwise still be set by
-        # this step's first lookup() and skip the poll.
-        self._processed_jobs_this_step = True
-        self._process_finished_jobs()
+        # Polled once per store phase: the step's storing requests run
+        # back-to-back in build_connector_meta(), so the first one polls and
+        # the rest reuse it. Not _maybe_process_finished_jobs(): this step's
+        # first lookup() already set the once-per-step gate, and eviction must
+        # see completions newer than that.
+        if not self._store_phase_polled_this_step:
+            self._store_phase_polled_this_step = True
+            self._processed_jobs_this_step = True
+            self._process_finished_jobs()
 
         # Step 2: Store to primary tier (new chunks only).
         # Cascading of these newly-stored chunks to ALL secondary tiers
@@ -1189,6 +1198,7 @@ class TieringOffloadingManager(OffloadingManager):
         # Reset the per-step gate AFTER serve_external_requests so that
         # lookup() calls within it skip redundant _process_finished_jobs().
         self._processed_jobs_this_step = False
+        self._store_phase_polled_this_step = False
 
         self._flush_pending_promotions()
         # Keys parked by this step's prepare_store cannot have completed yet, so
@@ -1287,6 +1297,7 @@ class TieringOffloadingManager(OffloadingManager):
         for req_id in finished_req_ids:
             del self._req_state[req_id]
         self._processed_jobs_this_step = False
+        self._store_phase_polled_this_step = False
 
         for tier in self.secondary_tiers:
             if tier.bp_detector is not None:
