@@ -193,6 +193,79 @@ class BareExternalOffloadingSpec(OffloadingSpec):
         raise NotImplementedError
 
 
+@pytest.mark.parametrize("flush", [False, True])
+def test_sync_load_and_pending_store_preserve_transfer_data(flush: bool):
+    from vllm.config import ParallelConfig, VllmConfig
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
+        OffloadingConnectorWorker,
+    )
+    from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+    from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+
+    class LocalSpec(BareExternalOffloadingSpec):
+        def get_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
+            return CPUOffloadingWorker(kv_caches, 1, 2)
+
+    page = FullAttentionSpec(
+        block_size=4, num_kv_heads=1, head_size=8, dtype=torch.float16
+    )
+    config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["layer"], page)],
+    )
+    vllm_config = VllmConfig(
+        parallel_config=ParallelConfig(
+            pipeline_parallel_size=2, distributed_executor_backend="mp"
+        )
+    )
+    connector = OffloadingConnectorWorker(
+        LocalSpec(_offloading_config()), vllm_config, config
+    )
+    gpu = torch.full((2, page.page_size_bytes), 7, dtype=torch.int8, device="cuda")
+    gpu[0].fill_(3)
+    connector.register_kv_caches({"layer": gpu})
+    backend = connector.worker
+    assert backend is not None
+
+    def gpu_spec(block_id: int) -> GPULoadStoreSpec:
+        return GPULoadStoreSpec([block_id], group_sizes=(1,), block_indices=(0,))
+
+    try:
+        assert backend.submit_store(100, gpu_spec(0), CPULoadStoreSpec([0]))
+        backend.wait({100})
+        assert {r.job_id for r in backend.get_finished()} == {100}
+        gpu[0].fill_(9)
+
+        store = OffloadingConnectorMetadata(
+            load_jobs={},
+            store_jobs={1: TransferJob("store", gpu_spec(1), CPULoadStoreSpec([1]))},
+        )
+        connector.prepare_store_kv(store)
+        metadata = OffloadingConnectorMetadata(
+            load_jobs={
+                2: TransferJob("load", CPULoadStoreSpec([0]), gpu_spec(0), sync=True)
+            },
+            store_jobs={},
+            jobs_to_flush={1} if flush else None,
+        )
+        connector.handle_preemptions(metadata)
+        torch.accelerator.synchronize()
+        completed = {r.job_id for r in backend.get_finished()}
+        assert completed == ({1} if flush else set())
+
+        connector.start_kv_transfers(metadata)
+        backend.wait({1})
+        completed |= {r.job_id for r in backend.get_finished()}
+        assert completed == {1, 2}
+        assert torch.all(gpu[0] == 3).item()
+        assert backend.submit_load(3, CPULoadStoreSpec([1]), gpu_spec(0))
+        backend.wait({3})
+        assert torch.all(gpu[0] == 7).item()
+    finally:
+        connector.shutdown()
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------

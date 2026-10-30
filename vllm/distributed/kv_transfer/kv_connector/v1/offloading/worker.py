@@ -236,23 +236,27 @@ class OffloadingConnectorWorker:
                         (job_id, entry.src_spec, entry.dst_spec)
                     )
 
-        # Submit deferred stores from previous step (and jobs_to_flush above).
+        if not kv_connector_metadata.jobs_to_flush and any(
+            job.sync for job in kv_connector_metadata.load_jobs.values()
+        ):
+            return
+
+        self._submit_pending_stores()
+
+        if kv_connector_metadata.jobs_to_flush:
+            self.worker.wait(kv_connector_metadata.jobs_to_flush)
+
+    def _submit_pending_stores(self):
+        assert self.worker is not None
         for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
             assert isinstance(src_spec, GPULoadStoreSpec)
             success = self.worker.submit_store(job_id, src_spec, dst_spec)
             assert success
         self._unsubmitted_store_jobs.clear()
 
-        if kv_connector_metadata.jobs_to_flush:
-            self.worker.wait(kv_connector_metadata.jobs_to_flush)
-
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
         assert self.worker is not None
         assert not self._unsubmitted_load_jobs
-        for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
-            success = self.worker.submit_store(job_id, src_spec, dst_spec)
-            assert success
-        self._unsubmitted_store_jobs.clear()
 
         sync_job_ids: set[int] = set()
         for job_id, entry in metadata.load_jobs.items():
@@ -266,6 +270,8 @@ class OffloadingConnectorWorker:
                 job_id, entry.src_spec, entry.dst_spec, expedited=True
             )
             assert success
+        # Overlap store submission with in-flight sync loads.
+        self._submit_pending_stores()
         if sync_job_ids:
             self.worker.wait(sync_job_ids)
 
