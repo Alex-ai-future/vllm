@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import ctypes
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Sequence
+
+import msgspec
 
 from vllm.v1.kv_offload.base import OffloadKey, ReqContext
 
@@ -22,22 +23,15 @@ def order_request_keys(
     return keys
 
 
-class ChunkStatus(ctypes.Structure):
-    """Offloading status for a single chunk of KV data.
-    Holds the following information:
+class ChunkStatus(msgspec.Struct, eq=False, gc=False):  # type: ignore[call-arg]
+    """CPU slot state; ref_cnt=-1 marks an unfinished write.
 
-    ref_cnt - the current number of transfers using this chunk as a source.
-        A value of -1 indicates the chunk is not yet ready to be read.
-    chunk_id - index of the physical CPU buffer slot.
+    Fields contain only integers, so cyclic garbage collection is unnecessary.
     """
 
-    _fields_ = [("ref_cnt", ctypes.c_int32), ("chunk_id", ctypes.c_int64)]
-
-    def __init__(self, chunk_id: int):
-        super().__init__()
-        # initialize chunk as "not ready" (ref_cnt = -1)
-        self.ref_cnt = -1
-        self.chunk_id = chunk_id
+    chunk_id: int
+    ref_cnt: int = -1
+    __hash__ = None  # type: ignore[assignment]
 
     @property
     def is_ready(self) -> bool:

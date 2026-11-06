@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import gc
 from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -22,6 +23,24 @@ from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 from vllm.v1.kv_offload.cpu.policies.base import ChunkStatus
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+
+
+def test_chunk_status_does_not_require_cyclic_gc():
+    """Live cache entries must not add work to cyclic garbage collection."""
+    chunk = ChunkStatus(42)
+    assert not gc.is_tracked(chunk)
+    chunk.ref_cnt = 0
+    chunk.ref_cnt += 1
+    assert not gc.is_tracked(chunk)
+
+
+def test_chunk_status_equality_preserves_slot_ownership():
+    """Matching slot numbers do not make separate allocation states equal."""
+    chunk = ChunkStatus(42)
+    assert chunk != ChunkStatus(42)
+    assert chunk == chunk
+    with pytest.raises(TypeError):
+        hash(chunk)
 
 
 def make_req_context(
